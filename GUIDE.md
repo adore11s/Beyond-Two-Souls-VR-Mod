@@ -61,7 +61,7 @@ These work while the game window or a SteamVR window is in front.
 |---|---|
 | `F9` | VR on / off |
 | `F2` | Recenter your view (SteamVR's own recenter works too) |
-| `F1` | First person while you play as Jodie, on / off |
+| `F1` | First person when you move as Jodie, on / off |
 | `F3` | First person in cutscenes, on / off |
 | `F10` | Xbox button prompts (saved in `b2svr.ini`) |
 | `F11` | PlayStation button prompts (saved in `b2svr.ini`). Prompts that ask you to tilt or move the controller (motion sensor) use your right VR controller: tilt it or move it up / down / left / right |
