@@ -24,14 +24,12 @@ VR turns on by itself a few seconds after the game starts. From then on you can 
 
 | Key | What it does |
 |---|---|
-| **F1** | First person when you move as Jodie |
-| **F3** | First person in cutscenes |
+| **Press both thumbsticks** (F1) | First person when you move as Jodie |
+| **Hold both thumbsticks** (F3) | First person in cutscenes |
 | **F10** | Xbox button prompts |
 | **F11** | PlayStation button prompts |
 
-**Shortcuts on the VR controllers:** press both thumbsticks once = **F1**, hold both thumbsticks = **F3**.
-
-The keys work while the game window or a SteamVR window is in front.
+The keyboard keys work while the game window or a SteamVR window is in front.
 
 ## Uninstall
 
