@@ -1,0 +1,9 @@
+{
+  "name": "b2svr",
+  "version-string": "0.9.0",
+  "description": "Beyond: Two Souls VR mod",
+  "dependencies": [
+    "minhook",
+    "openxr-loader"
+  ]
+}

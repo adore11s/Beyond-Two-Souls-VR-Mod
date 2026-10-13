@@ -1,0 +1,15 @@
+# cmd.exe resolves GOTO by seeking to a byte offset, so a .cmd checked out with LF endings can
+# misbehave; Windows PowerShell 5.1 and Notepad are happiest with CRLF too.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.ini text eol=crlf
+
+*.md   text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.json text eol=lf
+*.asm  text eol=crlf
+*.def  text eol=crlf
+*.txt  text eol=crlf
+
+*.dll binary

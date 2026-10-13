@@ -1,0 +1,12 @@
+# Written while installing / playing. None of it belongs in the repository.
+
+# Where the mod was installed (read by the uninstaller)
+game_dir.txt
+
+# Logs and crash reports, if a copy ends up here
+*.log
+b2svr_logs/
+
+# Build output and private symbols (see CONTRIBUTING.md)
+build/
+*.pdb
