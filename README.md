@@ -4,11 +4,12 @@ Play **Beyond: Two Souls (PC)** in VR. Every frame is drawn in true 3D for each 
 
 > ⚠️ **Work in progress.** It is playable but not finished; expect rough edges. First person (F1 / F3) is still being tuned.
 
-## What you need
+## What the mod does
 
-- **Beyond: Two Souls on PC** (Steam, Epic Games Store or another copy). The Steam build is verified; other builds are supported by signature (see GUIDE.md).
-- **A VR headset with SteamVR** (or another OpenXR runtime such as Virtual Desktop). Tested on PlayStation VR2.
-- **A strong graphics card.** The game is drawn twice, once per eye.
+- **Two ways to play.** Keep the game's **normal cameras**, drawn in 3D around you, or switch to **first person** and see everything through Jodie's eyes: **F1** while you play as Jodie, **F3** in cutscenes.
+- **Motion controls in first person.** Your VR controllers become Jodie's hands. This is still being worked on: so far it is tested with two of Jodie's looks, **young Jodie in the green shirt** and **adult Jodie in the red dress**. Other outfits may look off for now; I am slowly making them all work.
+- **Prompts you can see.** In first person (F1 / F3) the game's prompts appear in front of you.
+- **Recommended: play in F1 and switch F3 on only from time to time.** The game was not made for first person, so not every cutscene animation looks good through Jodie's eyes.
 
 ## Install
 
@@ -19,20 +20,18 @@ Play **Beyond: Two Souls (PC)** in VR. Every frame is drawn in true 3D for each 
 
 VR turns on by itself a few seconds after the game starts. From then on you can also start the game straight from Steam or the Epic Games Launcher; it stays in VR until you uninstall.
 
-## Keys
+## Controls
 
 | Key | What it does |
 |---|---|
-| **F9** | VR on / off |
-| **F2** | Recenter your view |
 | **F1** | First person while you play as Jodie |
 | **F3** | First person in cutscenes |
-| **F10** / **F11** | Xbox / PlayStation button prompts (remembered) |
+| **F10** | Xbox button prompts |
+| **F11** | PlayStation button prompts |
+
+**Shortcuts on the VR controllers:** press both thumbsticks once = **F1**, hold both thumbsticks = **F3**.
 
 The keys work while the game window or a SteamVR window is in front.
-On the VR controllers: **click both thumbsticks** for F1, **hold both thumbsticks** (about a second) for F3.
-
-➡️ All controls, settings and fixes: **[GUIDE.md](GUIDE.md)**
 
 ## Uninstall
 
@@ -48,7 +47,12 @@ Open an issue on the mod's GitHub page (**Issues** → **New issue**) with a few
 | **Something looks or works wrong, the game froze, or VR did not start** | **`b2svr_logs\b2svr.log`** from your game folder, right after quitting the game (if you have started the game again since, send **`b2svr.prev.log`** too) |
 | **The installer / launcher window showed an error** | **`setup_log.txt`** from this `B2S_VR_MOD` folder |
 
-None of these files contain your user name or other personal information. Saying roughly *when* it happened helps: set `timer_window=on` in `b2svr.ini` to see the time the log uses.
+None of these files contain your user name or other personal information.
+
+## Known bugs
+
+- **First person in cutscenes sometimes puts your view behind Jodie's head** (you see the back of her head). Fix: switch first person in cutscenes off and on a few times (**F3**, or hold both thumbsticks).
+- **First person in cutscenes: the lighting on characters can look bad.** The game was not made for first person, so characters are lit for the game's normal camera, and the lighting gets worse when that camera is not on them.
 
 ## Open source
 

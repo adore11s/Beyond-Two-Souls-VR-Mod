@@ -29,7 +29,6 @@ add_library(b2svr SHARED
     src/watchpoint.cpp
     src/sigdb.cpp
     src/prompts.cpp
-    src/timerwindow.cpp
     src/videowatch.cpp
     src/zonefix.cpp
     src/count_thunks.asm

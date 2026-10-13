@@ -123,7 +123,6 @@ When the game switches to a filtered camera view (for example the security camer
 | `controller` | xbox | Button prompts: xbox or playstation (F10 / F11 switch it and save it) |
 | `verified_build_only` | off | on = stay off on any game build except the verified one |
 | `signature_scan` | off | force = find game addresses by signature even on the verified build (testing) |
-| `timer_window` | off | on = a small desktop window shows the seconds since the game started (the log's times), for recording a problem |
 
 ---
 

@@ -11,9 +11,8 @@
 #include "game.h"
 #include "log.h"
 #include "probe.h"
-#include "timerwindow.h"
 
-#define B2SVR_VERSION "0.16.42"
+#define B2SVR_VERSION "0.16.43"
 
 namespace {
 
@@ -85,7 +84,6 @@ DWORD WINAPI InitThread(LPVOID) {
     b2s::Log("pid=%lu exe=%s base=%p arch=x64", GetCurrentProcessId(), Narrow(exePath).c_str(),
              GetModuleHandleW(nullptr));
     b2s::crash::Install(B2SVR_VERSION);
-    b2s::timerwindow::Start();
     // SteamStub builds decrypt .text after our DLL loads: retry until the core addresses resolve
     // (the analysed build by its hash, any other build by signature), at most 60 s.
     std::string textHash;
