@@ -44,6 +44,7 @@ The `ctest` suites are desk tests of the pose maths, the first-person rules, con
 ### Debugging
 
 - **Log.** Everything the mod does goes to `b2svr_logs\b2svr.log` next to the game's exe (the previous run: `b2svr.prev.log`).
+- **Privacy.** Players send the log, crash reports and `setup_log.txt` with bug reports, so they must never identify them. Every log line passes `LogScrub` (`src/log.cpp`): the game folder and user profile paths, the Windows user name and the computer name are replaced (`<game folder>`, `<user profile>`, `<user>`, `<pc>`); `tests/log_tests.cpp` checks it. The installer does the same for `setup_log.txt`. PC specs (Windows version, CPU, GPU, RAM, headset) are fine; never log account names, IDs, serial numbers or anything outside the game.
 - **Commands.** Write lines into `b2svr_cmd.txt` next to the exe while the game runs; they are executed within a few frames. Examples:
   - `xr on` / `xr off`
   - `recenter`

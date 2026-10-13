@@ -110,3 +110,9 @@ add_test(NAME vrinput_tests COMMAND vrinput_tests)
 add_executable(steam_shadow_tests tests/steam_shadow_tests.cpp)
 target_compile_options(steam_shadow_tests PRIVATE /W4 /permissive-)
 add_test(NAME steam_shadow_tests COMMAND steam_shadow_tests)
+
+# Privacy: what players send (the log, crash reports) never names them (src/log.cpp LogScrub).
+add_executable(log_tests tests/log_tests.cpp src/log.cpp)
+target_compile_definitions(log_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(log_tests PRIVATE /W4 /permissive-)
+add_test(NAME log_tests COMMAND log_tests)

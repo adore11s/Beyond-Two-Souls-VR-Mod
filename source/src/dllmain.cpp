@@ -13,7 +13,7 @@
 #include "probe.h"
 #include "timerwindow.h"
 
-#define B2SVR_VERSION "0.16.41"
+#define B2SVR_VERSION "0.16.42"
 
 namespace {
 

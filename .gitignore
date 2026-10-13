@@ -3,6 +3,10 @@
 # Where the mod was installed (read by the uninstaller)
 game_dir.txt
 
+# The installer / launcher log (sent with bug reports)
+setup_log.txt
+setup_log.prev.txt
+
 # Logs and crash reports, if a copy ends up here
 *.log
 b2svr_logs/

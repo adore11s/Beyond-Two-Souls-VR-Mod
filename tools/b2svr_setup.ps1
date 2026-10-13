@@ -30,6 +30,10 @@ $ErrorActionPreference = 'Stop'
 $ModDir = Split-Path -Parent $PSScriptRoot
 $Files = Join-Path $ModDir 'files'
 $StateGame = Join-Path $ModDir 'game_dir.txt'   # where the mod was installed (for the uninstaller)
+# Everything this script prints also goes to setup_log.txt in the B2S_VR_MOD folder (the previous run:
+# setup_log.prev.txt), with the Windows user name replaced by <user>: the file players send when the
+# installer / launcher fails.
+$SetupLog = Join-Path $ModDir 'setup_log.txt'
 
 # The game's exe: the Steam name first, then any other store's (BeyondTwoSouls*.exe).
 $ExeNames = @('BeyondTwoSouls_Steam.exe', 'BeyondTwoSouls.exe')
@@ -45,9 +49,35 @@ $AppIdMarker = 'b2svr_steam_appid.created'  # in the game folder: steam_appid.tx
 $ModDataFiles = @('b2svr.ini', 'b2svr.log', 'b2svr.prev.log', 'b2svr_cmd.txt', 'b2svr_cmd.done',
                   'b2svr_camdump.bin', 'b2svr_vpdump.bin')
 
-function Say([string]$t) { Write-Host "   $t" }
-function Warn([string]$t) { Write-Host "   [!] $t" -ForegroundColor Yellow }
-function Bad([string]$t) { Write-Host "   [X] $t" -ForegroundColor Red }
+# Privacy: setup_log.txt never names the player. Folder paths become <game folder> / <mod folder> /
+# <user profile>, the Windows user name (as a path part) <user>, the computer name <pc>. The screen
+# still shows the real paths.
+$script:ScrubPaths = New-Object System.Collections.ArrayList
+function Add-Scrub([string]$path, [string]$with) {
+    if ($path -and $path.Length -gt 3) { [void]$script:ScrubPaths.Add(@($path.TrimEnd('\', '/'), $with)) }
+}
+Add-Scrub $ModDir '<mod folder>'
+Add-Scrub $env:USERPROFILE '<user profile>'
+function Protect-Text([string]$t) {
+    # longest paths first, so a folder inside another one is named by its own label
+    foreach ($e in ($script:ScrubPaths | Sort-Object { $_[0].Length } -Descending)) {
+        $t = $t -replace [regex]::Escape($e[0]), $e[1]
+    }
+    $u = $env:USERNAME
+    if ($u -and $u.Length -gt 1) { $t = $t -replace ('(?i)(?<=[\\/])' + [regex]::Escape($u) + '(?=[\\/]|$)'), '<user>' }
+    $c = $env:COMPUTERNAME
+    if ($c -and $c.Length -gt 1) { $t = $t -replace [regex]::Escape($c), '<pc>' }
+    return $t
+}
+function Write-SetupLog([string]$t) {
+    try {
+        $t = Protect-Text $t
+        Add-Content -LiteralPath $SetupLog -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $t) -Encoding UTF8
+    } catch { }
+}
+function Say([string]$t) { Write-Host "   $t"; Write-SetupLog $t }
+function Warn([string]$t) { Write-Host "   [!] $t" -ForegroundColor Yellow; Write-SetupLog "[!] $t" }
+function Bad([string]$t) { Write-Host "   [X] $t" -ForegroundColor Red; Write-SetupLog "[X] $t" }
 function Ask([string]$prompt, [string]$default) {
     if ($Unattended) { Say "$prompt -> $default (unattended)"; return $default }
     return (Read-Host "   $prompt")
@@ -57,6 +87,23 @@ function Done([int]$code) {
     if (-not $Unattended) { [void](Read-Host '   Press Enter to close') }
     exit $code
 }
+# A new setup log for this run (the previous one kept as setup_log.prev.txt).
+try {
+    if (Test-Path -LiteralPath $SetupLog) {
+        Move-Item -LiteralPath $SetupLog -Destination (Join-Path $ModDir 'setup_log.prev.txt') -Force
+    }
+} catch { }
+Write-SetupLog ("B2S VR mod setup, mode $Mode; PowerShell $($PSVersionTable.PSVersion); " +
+                "$([Environment]::OSVersion.VersionString); 64-bit OS: $([Environment]::Is64BitOperatingSystem)")
+
+# Any error this script did not expect: shown, written to setup_log.txt, and the window stays open.
+trap {
+    Bad ('Unexpected error: ' + $_.Exception.Message)
+    Write-SetupLog ('  at line ' + $_.InvocationInfo.ScriptLineNumber + ': ' + $_.InvocationInfo.Line.Trim())
+    Say 'Please send setup_log.txt (in this B2S_VR_MOD folder) with your bug report.'
+    Done 1
+}
+
 function Banner([string]$title) {
     Write-Host ''
     Write-Host '  ================================================================'
@@ -243,6 +290,7 @@ function Show-Status([string]$game) {
 if ($Mode -eq 'Check') {
     Banner 'BEYOND: TWO SOULS VR MOD  -  CHECK (nothing is changed)'
     $game = Find-GameDir
+    Add-Scrub $game '<game folder>'
     if (-not $game) { Bad 'No Beyond: Two Souls folder found.'; Done 1 }
     $game = Use-GameDir $game
     Say "Game folder: $game"
@@ -258,6 +306,7 @@ if ($Mode -eq 'Play') {
     if (-not (Test-Path -LiteralPath $payload)) { Bad 'files\dinput8.dll is missing - re-extract the mod.'; Done 1 }
 
     $game = Find-GameDir
+    Add-Scrub $game '<game folder>'
     if (-not $game) { Bad 'No Beyond: Two Souls folder - nothing was changed.'; Done 1 }
     $game = Use-GameDir $game
     Say "Game folder: $game"
@@ -343,6 +392,7 @@ if ($Mode -eq 'Play') {
 if ($Mode -eq 'Uninstall') {
     Banner 'BEYOND: TWO SOULS VR MOD  -  UNINSTALL'
     $game = Find-GameDir
+    Add-Scrub $game '<game folder>'
     if (-not $game) { Bad 'No Beyond: Two Souls folder found - nothing was changed.'; Done 1 }
     $game = Use-GameDir $game
     Say "Game folder: $game"

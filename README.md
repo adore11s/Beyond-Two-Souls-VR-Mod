@@ -38,9 +38,17 @@ On the VR controllers: **click both thumbsticks** for F1, **hold both thumbstick
 
 Double-click **`Uninstall VR mod.cmd`**. It puts the game folder back as it was. **Your saves are never touched.**
 
-## It crashed?
+## Something went wrong?
 
-A crash report is saved in **`b2svr_logs\crash_reports`** inside your game folder. It contains no personal information. Please send it along with a few words on what you were doing.
+Open an issue on the mod's GitHub page (**Issues** → **New issue**) with a few words on what you were doing, and attach:
+
+| What happened | Send |
+|---|---|
+| **The game crashed** | The newest **`crash_<date>.txt`** and **`crash_<date>_log.txt`** from **`b2svr_logs\crash_reports`** in your game folder |
+| **Something looks or works wrong, the game froze, or VR did not start** | **`b2svr_logs\b2svr.log`** from your game folder, right after quitting the game (if you have started the game again since, send **`b2svr.prev.log`** too) |
+| **The installer / launcher window showed an error** | **`setup_log.txt`** from this `B2S_VR_MOD` folder |
+
+None of these files contain your user name or other personal information. Saying roughly *when* it happened helps: set `timer_window=on` in `b2svr.ini` to see the time the log uses.
 
 ## Open source
 

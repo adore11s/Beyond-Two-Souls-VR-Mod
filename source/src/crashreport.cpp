@@ -1,11 +1,14 @@
 #include "crashreport.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <d3d11.h>
 #include <dxgi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -18,11 +21,35 @@ namespace {
 
 // ---- facts collected ahead of time (a crashed process should do as little as possible) ----
 char g_version[64] = "?";
+// SHA-256 of the mod's own DLL file: the name of its folder in the private symbols archive
+// (tools/make_release.ps1: backups\symbols\<SHA-256>\dinput8.pdb), so a report maps to its exact build.
+char g_dllHash[72] = "?";
 char g_textHash[80] = "not checked yet";
 bool g_checked = false, g_supported = false;
 char g_os[96] = "?", g_cpu[96] = "?", g_ram[32] = "?", g_gpu[192] = "(game device not created yet)";
-char g_user[96] = "";
 uintptr_t g_exeBase = 0, g_exeSize = 0, g_modBase = 0, g_modSize = 0;
+
+// SHA-256 of the DLL file on disk (upper-case hex, as Get-FileHash prints it).
+void HashOwnFile(HMODULE self) {
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(self, path, MAX_PATH)) return;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+        BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0) {
+        static UCHAR buf[1 << 16];
+        DWORD got = 0;
+        while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) BCryptHashData(hash, buf, got, 0);
+        UCHAR digest[32];
+        if (BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0)
+            for (int i = 0; i < 32; ++i) sprintf_s(g_dllHash + i * 2, 3, "%02X", digest[i]);
+    }
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(f);
+}
 
 void ModuleRange(HMODULE m, uintptr_t* base, uintptr_t* size) {
     const auto* b = reinterpret_cast<const uint8_t*>(m);
@@ -45,7 +72,6 @@ void CollectSystemInfo() {
     for (size_t n = strlen(g_cpu); n && g_cpu[n - 1] == ' '; --n) g_cpu[n - 1] = 0;  // the registry pads it
     MEMORYSTATUSEX ms{sizeof(ms)};
     if (GlobalMemoryStatusEx(&ms)) sprintf_s(g_ram, "%.0f GB", double(ms.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0));
-    GetEnvironmentVariableA("USERNAME", g_user, sizeof(g_user));
 }
 
 // ---- the report text: one static buffer, no heap ----
@@ -61,21 +87,12 @@ void Add(const char* fmt, ...) {
     g_repLen = n < 0 ? sizeof(g_rep) - 1 : g_repLen + size_t(n);
 }
 
-// A log line with the Windows user name replaced (paths like C:\Users\<name>\...).
+// A log line, scrubbed again (lines are scrubbed when logged; this also covers a line logged before the
+// log was opened).
 void AddScrubbed(const char* line, void*) {
     char out[400];
-    size_t o = 0;
-    const size_t ul = strlen(g_user);
-    for (const char* p = line; *p && o < sizeof(out) - 8;) {
-        if (ul > 1 && _strnicmp(p, g_user, ul) == 0) {
-            memcpy(out + o, "<user>", 6);
-            o += 6;
-            p += ul;
-        } else {
-            out[o++] = *p++;
-        }
-    }
-    out[o] = 0;
+    strncpy_s(out, line, _TRUNCATE);
+    LogScrub(out, sizeof(out));
     Add("  %s\r\n", out);
 }
 
@@ -114,6 +131,18 @@ const char* ExceptionName(DWORD c) {
     }
 }
 
+// The whole log of the crashed run, saved beside the report (crash_<date>_log.txt): the next two game
+// starts rotate b2svr.log away, and the report only holds its last lines. Its lines are already scrubbed
+// (LogScrub, when they were logged), so this is a plain copy.
+void CopyLog(const SYSTEMTIME& t) {
+    if (!LogDir()[0]) return;
+    wchar_t src[MAX_PATH], dst[MAX_PATH];
+    swprintf_s(src, L"%s\\b2svr.log", LogDir());
+    swprintf_s(dst, L"%s\\crash_reports\\crash_%04u-%02u-%02u_%02u-%02u-%02u_log.txt", LogDir(), t.wYear, t.wMonth, t.wDay,
+               t.wHour, t.wMinute, t.wSecond);
+    CopyFileW(src, dst, FALSE);
+}
+
 void WriteReport(EXCEPTION_POINTERS* ep) {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -129,7 +158,7 @@ void WriteReport(EXCEPTION_POINTERS* ep) {
     Add("Please send this file with a few words on what you were doing when the game crashed.\r\n");
     Add("It holds no personal data: no user name, no files or folders outside the game.\r\n\r\n");
     Add("When:        %04u-%02u-%02u %02u:%02u:%02u\r\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    Add("Mod:         B2SVR %s\r\n", g_version);
+    Add("Mod:         B2SVR %s (dinput8.dll sha256 %s)\r\n", g_version, g_dllHash);
     Add("Game:        .text sha256 %s (%s)\r\n", g_textHash,
         !g_checked ? "the mod was still starting up" : g_supported ? "the supported build" : "NOT a supported build - mod was off");
     Add("Windows:     %s\r\n", g_os);
@@ -184,6 +213,7 @@ void WriteReport(EXCEPTION_POINTERS* ep) {
     }
     Log("CRASH report written: b2svr_logs\\crash_reports%ls (%s at %s)", file, ExceptionName(er->ExceptionCode), where);
     LogFlush();
+    CopyLog(t);
 }
 
 // ---- first-chance logger: where a crash started (never handles anything) ----
@@ -308,13 +338,15 @@ void Install(const char* modVersion) {
     ModuleRange(GetModuleHandleW(nullptr), &g_exeBase, &g_exeSize);
     HMODULE self = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&Install), &self) && self)
+                           reinterpret_cast<LPCWSTR>(&Install), &self) && self) {
         ModuleRange(self, &g_modBase, &g_modSize);
+        HashOwnFile(self);
+    }
     CollectSystemInfo();
     AddVectoredExceptionHandler(1, FirstChance);
     LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(Filter);
     if (prev && prev != Filter) g_gameFilter = prev;
-    Log("crash: reports on (b2svr_logs\\crash_reports); %s %s, %s", g_os, g_cpu, g_ram);
+    Log("crash: reports on (b2svr_logs\\crash_reports); %s %s, %s; dinput8.dll sha256 %s", g_os, g_cpu, g_ram, g_dllHash);
 }
 
 void InstallLate(const char* textSha256, bool supportedBuild) {

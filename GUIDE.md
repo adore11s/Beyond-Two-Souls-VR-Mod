@@ -164,6 +164,9 @@ The mod falls back to the monitor and keeps trying to reconnect every 5 seconds.
 Click the game window (or the SteamVR window) first: the keys only work while one of them is in front. F1 only acts while you control Jodie; it waits through loading screens, menus and Aiden sections.
 
 **The game crashed**
-- A crash report is saved in `b2svr_logs\crash_reports\crash_<date>.txt`.
-- It holds your PC and headset details, the mod's state and where the crash happened. It contains no user name or personal files.
-- Please send it along with a few words on what you were doing.
+- A crash report is saved in `b2svr_logs\crash_reports\crash_<date>.txt`, with the whole log of that run beside it (`crash_<date>_log.txt`).
+- They hold your PC and headset details, the mod's version and state, where the crash happened and what the mod did before it. They contain no user name or personal files.
+- Please send both, along with a few words on what you were doing (see **Something went wrong?** in README.md).
+
+**The installer / launcher shows an error or closes**
+- Everything it printed is in `setup_log.txt` in the `B2S_VR_MOD` folder (the run before: `setup_log.prev.txt`). Please send that file.
