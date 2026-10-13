@@ -29,7 +29,7 @@ VR turns on by itself a few seconds after the game starts. From then on you can 
 | **F10** | Xbox button prompts |
 | **F11** | PlayStation button prompts |
 
-The keyboard keys work while the game window or a SteamVR window is in front.
+To quickly switch between the first-person modes, use both thumbsticks on your VR controllers, or, if you're playing on keyboard without VR controllers, the keys **F1** and **F3**.
 
 ## Uninstall
 
