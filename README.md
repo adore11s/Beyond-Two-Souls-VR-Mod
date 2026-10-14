@@ -10,6 +10,7 @@ Play **Beyond: Two Souls (PC)** in VR. Every frame is drawn in true 3D for each 
 - **Motion controls in first person.** Your VR controllers become Jodie's hands. This is still being worked on: so far it is tested with two of Jodie's looks, **young Jodie in the green shirt** and **adult Jodie in the red dress**. Other outfits may look off for now; I am slowly making them all work.
 - **Prompts you can see.** In first person (F1 / F3) the game's prompts appear in front of you.
 - **Recommended: play in F1 and switch F3 on only from time to time.** The game was not made for first person, so not every cutscene animation looks good through Jodie's eyes.
+- **Trying F3 (first person in cutscenes)?** Turn off **Depth of field** in the game's graphics settings first.
 
 ## Install
 
