@@ -335,124 +335,10 @@ void Frame() {
     }
 }
 
-// Diagnostic (0.17.3, "The Party": the right eye lost objects in some shots): the scene camera's room at
-// the start of each eye pass; a frame whose right-eye pass starts from another room than its left-eye
-// pass is logged (first 30, then counted).
-void* g_passRoom[2] = {};
-uint64_t g_roomSplits = 0, g_roomSplitReported = 0;
-
-// 0.17.8 (owner, "The Party", F1 at the enterable house: "looking down renders nothing, plain blue; looking up
-// most things but not the door, sometimes no shadows"). In F1 the eye is at Jodie's head, but every eye pass
-// starts from the game camera's room (outside: no box), and her own room was not found there ("0 at Jodie's
-// body"). The house is the one room with a box (LIVE `zones`: (-12.4 -5.1 -3.5)-(12.5 5.3 8.5)). `eyeroom on`:
-// each eye pass starts from the smallest known room box holding THAT eye (the camera node after the eye pose,
-// read at the start of the pass), else the game camera's room as before.
-std::atomic<int> g_eyeRoom{0};  // 0 off, 1 known room boxes, 2 the game's own lookup (FUN_14092e2b0)
-// STATIC (0.17.9): FUN_14092e2b0(scene, point, hint room) is the game's "which room holds this point": the hint
-// room if its volume (+0x118 -> +0x28, test FUN_1409dee30) holds it, else every room of the scene (+400 list)
-// whose volume holds it, else the scene's default room. FUN_14086c540 (VIEWPORT setup, once per frame key) uses
-// it with the camera node's position and keeps the result at VIEWPORT+0x8b0, while visibility starts from the
-// camera entity's own room (+0x98 -> VIEWPORT+0x41e0). With the eye moved off the game camera the two differ.
-constexpr uint64_t kFindZoneVa = 0x14092e2b0;
-using FindZoneFn = void* (*)(void* scene, const float* point, void* hint);
-FindZoneFn g_findZone = nullptr;
-int g_gameRoomLogs = 0;
-void* g_gameRoomLast[2] = {};
-uint64_t g_darkRoomAt[2] = {};
-int g_darkRoomLogs = 0;
-void* g_eyeRoomLast[2] = {};
-int g_eyeRoomLogs = 0;
-
-void* RoomHolding(const float p[3]) {
-    void* best = nullptr;
-    float bestVolume = 3.4e38f;
-    for (int k = 0; k < g_knownCount; ++k) {
-        float mn[3], mx[3];
-        void* z = g_knownZones[k];
-        if (!IsZone(z) || !ZoneBox(z, mn, mx) || !Inside(p, mn, mx)) continue;
-        const float volume = (mx[0] - mn[0]) * (mx[1] - mn[1]) * (mx[2] - mn[2]);
-        if (volume < bestVolume) {
-            bestVolume = volume;
-            best = z;
-        }
-    }
-    return best;
-}
-
-void BeginPass(void* const* cams, int count, int eye) {
+void BeginPass(void* const* cams, int count) {
     g_savedCount = 0;
     if (!cams || count <= 0) return;
     g_lastCam = cams[0];
-    if (eye == 0 || eye == 1) {
-        void* room = nullptr;
-        ReadPtr(cams[0], kEntityZone, &room);
-        g_passRoom[eye] = room;
-        if (eye == 1 && room != g_passRoom[0]) {
-            const uint64_t n = ++g_roomSplits;
-            if (n <= 30)
-                Log("ZONE eye passes start from different rooms: left %p, right %p (camera %p)", g_passRoom[0], room,
-                    cams[0]);
-            else if (n - g_roomSplitReported >= 900) {
-                g_roomSplitReported = n;
-                Log("ZONE eye passes started from different rooms in %llu frames", static_cast<unsigned long long>(n));
-            }
-        }
-    }
-    // The game's own room for each eye (diagnostic always; `eyeroom game` starts the pass from it).
-    if ((eye == 0 || eye == 1) && g_zoneVt) {
-        if (!g_findZone) g_findZone = reinterpret_cast<FindZoneFn>(game::Va(kFindZoneVa));
-        void* zone = nullptr;
-        float p[4] = {0, 0, 0, 1};
-        void* scene = SceneOf(cams[0]);
-        if (g_findZone && scene && ReadPtr(cams[0], kEntityZone, &zone) && IsZone(zone) && EntityPosition(cams[0], p)) {
-            void* room = nullptr;
-            __try {
-                room = g_findZone(scene, p, zone);
-            } __except (EXCEPTION_EXECUTE_HANDLER) { room = nullptr; }
-            if (xr::ViewDark()) {
-                const uint64_t now = GetTickCount64();
-                if (now - g_darkRoomAt[eye] >= 500 && g_darkRoomLogs < 160) {
-                    g_darkRoomAt[eye] = now;
-                    ++g_darkRoomLogs;
-                    Log("DARK eye %d at (%.2f %.2f %.2f): camera's room %p, the game's room for that point %p", eye, p[0],
-                        p[1], p[2], zone, room);
-                }
-            }
-            if (room != g_gameRoomLast[eye]) {
-                g_gameRoomLast[eye] = room;
-                if (g_gameRoomLogs++ < 80)
-                    Log("ZONE eye %d at (%.2f %.2f %.2f): the game puts it in room %p, the camera's room is %p%s", eye, p[0],
-                        p[1], p[2], room, zone, room != zone ? " (DIFFERENT)" : "");
-            }
-            if (g_eyeRoom == 2 && room && IsZone(room) && room != zone && WritePtr(cams[0], kEntityZone, room)) {
-                g_saved[g_savedCount++] = {cams[0], zone, room};
-                return;
-            }
-        }
-    }
-    if (g_eyeRoom == 1 && (eye == 0 || eye == 1) && g_zoneVt) {
-        const uint64_t now = GetTickCount64();
-        if (eye == 0 && now - g_knownAt >= 500) {
-            g_knownAt = now;
-            RefreshKnownZones(cams[0]);
-        }
-        for (int i = 0; i < count && g_savedCount < static_cast<int>(std::size(g_saved)); ++i) {
-            void* cam = cams[i];
-            void* zone = nullptr;
-            float p[3];
-            if (!cam || !ReadPtr(cam, kEntityZone, &zone) || !IsZone(zone) || !EntityPosition(cam, p)) continue;
-            void* room = RoomHolding(p);
-            if (i == 0 && room != g_eyeRoomLast[eye]) {
-                g_eyeRoomLast[eye] = room;
-                if (g_eyeRoomLogs++ < 60)
-                    Log("ZONE eye %d at (%.2f %.2f %.2f): %s %p (the game camera's room %p)", eye, p[0], p[1], p[2],
-                        room ? "inside room" : "in no room box, keeps the camera's room", room, zone);
-            }
-            if (!room || room == zone || !WritePtr(cam, kEntityZone, room)) continue;
-            g_saved[g_savedCount++] = {cam, zone, room};
-        }
-        if (g_savedCount) return;
-    }
     if (!g_firstPerson) return;
     for (int i = 0; i < count && g_savedCount < static_cast<int>(std::size(g_saved)); ++i) {
         void* cam = cams[i];
@@ -507,14 +393,6 @@ bool Command(const char* verb, const char* arg) {
                     mx[1], mx[2], camPos && Inside(cam, mn, mx) ? " holds the camera" : "",
                     g_knownZones[k] == camZone ? " [camera's room]" : "");
         }
-        return true;
-    }
-    if (std::strcmp(verb, "eyeroom") == 0) {
-        g_eyeRoom = !arg ? 0 : std::strcmp(arg, "on") == 0 || std::strcmp(arg, "box") == 0 ? 1 : std::strcmp(arg, "game") == 0 ? 2 : 0;
-        g_eyeRoomLast[0] = g_eyeRoomLast[1] = nullptr;
-        Log("ZONE eye passes start from: %s", g_eyeRoom == 2   ? "the room the game finds for each eye"
-                                              : g_eyeRoom == 1 ? "the room box holding each eye"
-                                                               : "the game camera's room");
         return true;
     }
     if (std::strcmp(verb, "zonefix") != 0) return false;

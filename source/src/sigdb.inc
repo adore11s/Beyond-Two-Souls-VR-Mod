@@ -140,5 +140,4 @@
 {SigKind::Code, "TEXTURE_DX11::IsLetterboxed", 0x140cbdbc0ull, "83 79 4C 00 0F 95 C0 88 02 0F B6 41 49 C3 CC CC", 0, 0, 0, 0x0ull, ""},
 {SigKind::Code, "MPAR_GUI::PlaceElement3D", 0x140e46850ull, "48 8B C4 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 D8 FB FF FF", 0, 0, 0, 0x0ull, ""},
 {SigKind::Vtable, "MPAR_ELEMENT_ICONIC vtable", 0x14179d130ull, "", 0, 0, 0, 0x0ull, ".?AVMPAR_ELEMENT_ICONIC@SINT@QDT@@"},
-{SigKind::Data, "g_portalCulling", 0x141c79002ull, "88 0D ?? ?? ?? ?? C3 CC CC CC CC CC CC CC CC CC 48 89 0D ?? ?? ?? ??", 2, 6, 0, 0x0ull, ""},
-{SigKind::Code, "SCENE::FindZoneForPoint", 0x14092e2b0ull, "48 89 5C 24 10 48 89 74 24 20 4C 89 44 24 18 57 41 56", 0, 0, 0, 0x0ull, ""},
+{SigKind::Data, "g_menuBand1080", 0x1417ad180ull, "41 C1 EA 0A F3 0F 5E 05 ?? ?? ?? ??", 8, 12, 0, 0x0ull, ""},

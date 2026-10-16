@@ -62,7 +62,6 @@ None of these files contain your user name or other personal information.
 
 - **The Party level is drawn wrong in VR.** Objects, shadows and the door go missing, and sometimes the whole picture turns plain blue or black, mostly around the house you can walk into (as Jodie and as Aiden). For now, press **F9** to switch VR off and play this level on your monitor, then press **F9** again to go back to VR.
 - **First person (F1 / F3) still has drawing problems.** Parts of the picture can go missing or turn black for a moment (for example when you walk into another room), and the lighting on characters can look bad: the game was not made for first person, so characters are lit for the game's normal camera.
-- **Subtitles can be cut off at the bottom.**
 
 ## Open source
 

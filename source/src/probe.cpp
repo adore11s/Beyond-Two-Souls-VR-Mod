@@ -428,29 +428,12 @@ int g_measureFrames = 0, g_measureLeftFrames = 0;  // render thread (set by the 
 uint64_t g_measureLeft = 0, g_measureRight = 0;
 char g_measureTag[32] = {};
 uint32_t g_leftDraws = 0;
-// While the headset view is dark: each eye's draws next to the bright-view average, to tell a scene
-// that drew nothing (visibility found nothing) from one drawn and then blacked out.
-uint64_t g_brightLeft16 = 0, g_brightRight16 = 0;  // running averages x16
-uint64_t g_darkDiagAt = 0;
-int g_darkDiagLogs = 0;
 
 void EyeMarker(int eye) {
     const uint32_t draws = g_eyeDraws.exchange(0, std::memory_order_relaxed);
     if (eye == 0) {
         g_leftDraws = draws;
         return;
-    }
-    if (xr::ViewDark()) {
-        const uint64_t now = GetTickCount64();
-        if (now - g_darkDiagAt >= 500 && g_darkDiagLogs < 120) {
-            g_darkDiagAt = now;
-            ++g_darkDiagLogs;
-            Log("DARK eyes drew left %u, right %u (bright view averages left %llu, right %llu)", g_leftDraws, draws,
-                static_cast<unsigned long long>(g_brightLeft16 >> 4), static_cast<unsigned long long>(g_brightRight16 >> 4));
-        }
-    } else {
-        g_brightLeft16 += g_leftDraws - (g_brightLeft16 >> 4);
-        g_brightRight16 += draws - (g_brightRight16 >> 4);
     }
     if (g_measureLeftFrames > 0) {
         g_measureLeft += g_leftDraws;
@@ -828,14 +811,8 @@ using SetPredFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Predicate
 GetDataFn g_origGetData = nullptr;
 SetPredFn g_origSetPred = nullptr;
 std::atomic<bool> g_occlForce{false};
-// 0.17.9 (owner, "The Party": objects / the whole scene missing in the second eye; LIVE A/B with head offsets:
-// 9 of 12 captures broken with the game's results, 2 of 12 with every query reported visible; frame time
-// unchanged at 90 fps). Default: report every occlusion query visible while VR runs (`occl vr`); `occl off`
-// = the game's results, `occl force` = always.
-std::atomic<bool> g_occlForceVr{true};
-bool OcclForced() { return g_occlForce || (g_occlForceVr && xr::Running()); }
 std::atomic<int> g_occlCensus{0};
-std::atomic<uint64_t> g_qOccl{0}, g_qPred{0}, g_qOther{0}, g_qPredSet{0}, g_qNotReady{0};
+std::atomic<uint64_t> g_qOccl{0}, g_qPred{0}, g_qOther{0}, g_qPredSet{0};
 
 HRESULT STDMETHODCALLTYPE HookGetData(ID3D11DeviceContext* c, ID3D11Asynchronous* a, void* data, UINT size,
                                       UINT flags) {
@@ -848,20 +825,11 @@ HRESULT STDMETHODCALLTYPE HookGetData(ID3D11DeviceContext* c, ID3D11Asynchronous
     q->Release();
     if (d.Query == D3D11_QUERY_OCCLUSION) {
         g_qOccl++;
-        if (hr == S_FALSE) g_qNotReady++;
         if (g_shCountFrames > 0) g_passOccl++;
-        // A result the GPU has not finished ("not ready", S_FALSE) also counts as visible: the second eye
-        // pass asks right after the first one recorded the queries (0.17.11).
-        if (OcclForced() && (hr == S_OK || hr == S_FALSE) && size >= sizeof(UINT64)) {
-            *static_cast<UINT64*>(data) = 1u << 20;
-            return S_OK;
-        }
+        if (g_occlForce && hr == S_OK && size >= sizeof(UINT64)) *static_cast<UINT64*>(data) = 1u << 20;
     } else if (d.Query == D3D11_QUERY_OCCLUSION_PREDICATE) {
         g_qPred++;
-        if (OcclForced() && (hr == S_OK || hr == S_FALSE) && size >= sizeof(BOOL)) {
-            *static_cast<BOOL*>(data) = TRUE;
-            return S_OK;
-        }
+        if (g_occlForce && hr == S_OK && size >= sizeof(BOOL)) *static_cast<BOOL*>(data) = TRUE;
     } else {
         g_qOther++;
     }
@@ -870,7 +838,7 @@ HRESULT STDMETHODCALLTYPE HookGetData(ID3D11DeviceContext* c, ID3D11Asynchronous
 
 void STDMETHODCALLTYPE HookSetPred(ID3D11DeviceContext* c, ID3D11Predicate* p, BOOL value) {
     if (p) g_qPredSet++;
-    g_origSetPred(c, OcclForced() ? nullptr : p, value);
+    g_origSetPred(c, g_occlForce ? nullptr : p, value);
 }
 
 // EXP-025: occlusion queries are read once per frame, after the right-eye pass overwrote them, so
@@ -1060,14 +1028,12 @@ bool Command(const char* verb, const char* arg) {
     }
     if (std::strcmp(verb, "occl") == 0) {
         if (arg && std::strcmp(arg, "force") == 0) g_occlForce = true;
-        else if (arg && std::strcmp(arg, "off") == 0) g_occlForce = g_occlForceVr = false;
-        else if (arg && std::strcmp(arg, "vr") == 0) { g_occlForce = false; g_occlForceVr = true; }
+        else if (arg && std::strcmp(arg, "off") == 0) g_occlForce = false;
         else if (arg && std::strcmp(arg, "eye0") == 0) g_occlEye0 = true;
         else if (arg && std::strcmp(arg, "botheyes") == 0) g_occlEye0 = false;
         Log("OCCL eye0=%d skipped(right-eye pass)=%llu", int(g_occlEye0.load()), g_occlSkipped.load());
-        Log("OCCL force=%d (in VR %d) GetData: occlusion=%llu (not ready %llu) predicate=%llu other=%llu "
-            "SetPredication(non-null)=%llu",
-            int(g_occlForce.load()), int(g_occlForceVr.load()), g_qOccl.load(), g_qNotReady.load(), g_qPred.load(), g_qOther.load(), g_qPredSet.load());
+        Log("OCCL force=%d GetData: occlusion=%llu predicate=%llu other=%llu SetPredication(non-null)=%llu",
+            int(g_occlForce.load()), g_qOccl.load(), g_qPred.load(), g_qOther.load(), g_qPredSet.load());
         return true;
     }
     if (std::strcmp(verb, "frametrace") != 0) return false;

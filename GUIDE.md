@@ -148,7 +148,6 @@ Nothing in the game is replaced, patched or edited on disk.
 ## Known limitations
 
 - **The Party level is drawn wrong in VR.** Objects, shadows and the door go missing, and sometimes the whole picture turns plain blue or black, mostly around the house you can walk into. Press **F9** to play this level on your monitor and **F9** again afterwards to go back to VR.
-- **Subtitles can be cut off at the bottom** with the square VR picture.
 - **First person is still being tuned.** The view height, hand positions and wrist angles may be off in some scenes: adjust them with `fp_eye_fwd`, `fp_eye_up` and `fp_wrist_pitch` in `b2svr.ini`. Press F1 / F3 again to go back to the game's cameras at any time.
 - **Cinematic framing.** Some cutscenes keep the game's widescreen framing.
 - **Performance.** The game is drawn twice per frame; pick a smaller VR picture size in the launcher, or lower the game's graphics settings, if the headset stutters.

@@ -4,6 +4,7 @@
 #include <MinHook.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -109,6 +110,36 @@ uint8_t* DisplayCfg() {
     return a ? *reinterpret_cast<uint8_t**>(a) : nullptr;
 }
 
+// Menus, subtitles and the 2D video rectangle (0.17.13, owner: "since square rendering the subtitles are
+// cut off at the bottom", on the monitor too). STATIC: FUN_140d22cb0 builds each menu display with
+// MM_DISPLAY+0x1e0 = height * (sceneH * 1080 / 817.0213) / renderH, and FUN_140c82120 makes the video
+// rectangle sceneH * 780 / 817.0213 high. 817.02 is the letterbox band of a 1080-high screen, so with the
+// game's band the factor is 1. Square has no band (scene = render height): 1080 / 817 = 1.32 times taller,
+// and the bottom 16% of every menu (where the subtitles are) falls below the picture (LIVE 0.17.12: the main
+// menu's lines 1.32 times farther from the middle than at 16:9). The constant (.rdata, read only by those
+// two) is 1080 while square, so both lay out as with the game's band; menus built before keep theirs.
+constexpr uint64_t kMenuBandVa = 0x1417ad180;
+constexpr float kMenuBand = 817.0213f, kMenuBandSquare = 1080.f;
+
+void SetMenuBand(bool square) {
+    const uintptr_t a = game::Va(kMenuBandVa);
+    if (!a) return;
+    auto* f = reinterpret_cast<float*>(a);
+    const float want = square ? kMenuBandSquare : kMenuBand;
+    if (*f == want) return;
+    if (std::fabs(*f - kMenuBand) > 0.01f && std::fabs(*f - kMenuBandSquare) > 0.01f) {
+        static bool logged = false;
+        if (!logged) Log("RENDERSIZE menu band constant is %.3f, not the game's: menus left alone", *f);
+        logged = true;
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(f, sizeof(float), PAGE_READWRITE, &old)) return;
+    *f = want;
+    VirtualProtect(f, sizeof(float), old, &old);
+    Log("RENDERSIZE menus and subtitles laid out for %s", square ? "the square picture" : "the game's own picture");
+}
+
 // Game thread, renderer lock held: the game's own size path with (w, h).
 void Resize(uint8_t* cfg, uint32_t w, uint32_t h, bool square) {
     // Square: the scene fills the whole picture (no letterbox band), and the render targets are
@@ -121,6 +152,7 @@ void Resize(uint8_t* cfg, uint32_t w, uint32_t h, bool square) {
         At<uint8_t>(cfg, kLetterbox) = *reinterpret_cast<const uint8_t*>(cache);
     }
     g_noBand = square;
+    SetMenuBand(square);
     g_inOwnCall = true;
     g_origSet(nullptr, w, h);
     g_inOwnCall = false;

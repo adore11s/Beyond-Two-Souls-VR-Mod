@@ -1039,17 +1039,6 @@ void RestoreEngineFov();
 void PrimeEyeCamera();
 void PrimeViewports(void* list, void* cmdbuf);
 std::atomic<bool> g_engineFov{true};  // EXP-016: owner saw culling cut at top/bottom/sides
-// 0.17.4 (owner, "The Party": in some shots the RIGHT eye lost the houses, cars, sky / the car and its
-// passengers - the opening aerial shot next to a roof, a dashboard shot inside the car's pillar). LIVE A/B
-// (EXP-041): occlusion queries, frame key, shared cull view, visibility freeze and a per-eye room all
-// ruled out; `enginefov off` fixed every bad frame. Variants, 35 rounds each: the headset scalars only
-// until the first stereo camera build of the pass ("early") fixed every bad frame of the right eye and
-// left the left eye identical to "whole pass" (same edges: the pass-start visibility still covers the
-// headset, EXP-016 / 019); from the build on ("late") failed like "whole pass". So a consumer after the
-// camera build misreads the wide scalars for the second eye. Modes: 1 = whole pass, 2 = early (default),
-// 3 = late. `enginefov on|off|early|late`.
-std::atomic<int> g_engineFovMode{2};
-bool g_engineFovBuilt = false;  // early mode: this pass's first stereo build has run
 void ApplyEngineFov(void* camp);
 std::atomic<bool> g_nodePass{true};  // EXP-018
 uint8_t* CameraNode(void* cam);
@@ -1220,9 +1209,8 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
                 if (uint8_t* node = CameraNode(g_stereoCams[k])) SetNodeRelative(node, NodeRel(eye));
                 // EXP-019: the headset FOV/aspect from the pass start: "Compute visibilities" runs
                 // before the first CAMERA::Build and culled with the game's ~25 deg camera.
-                if (g_engineFov && g_engineFovMode != 3) ApplyEngineFov(g_stereoCams[k]);
+                if (g_engineFov) ApplyEngineFov(g_stereoCams[k]);
             }
-        g_engineFovBuilt = false;
         // EXP-022: before any stage of this pass runs, the engine's camera globals still hold the
         // previous pass (for the left eye: the right eye of the PREVIOUS frame). Build this eye's
         // camera now and publish its matrices so pass-start consumers see the current eye.
@@ -1243,7 +1231,7 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
             }
         }
         // 0.16.35: the visibility pass starts from the room the eye is in (zonefix.h).
-        zonefix::BeginPass(g_stereoCams, g_stereoCamCount, eye);
+        zonefix::BeginPass(g_stereoCams, g_stereoCamCount);
         orig(list, cmdbuf, mode, flag);
         zonefix::EndPass();
         if (frameCounter) *frameCounter = savedCounter;
@@ -1534,7 +1522,7 @@ void BeforeCameraBuild(void* cam) {
     if (!node) return;
     SetNodeRelative(node, NodeRel(eye));
     g_viewCarriesEye = g_eyePoseMode == 0;  // mode 2: AfterCameraBuild shifts the centre view per eye
-    if (g_engineFov && !(g_engineFovMode == 2 && g_engineFovBuilt)) ApplyEngineFov(cam);
+    if (g_engineFov) ApplyEngineFov(cam);
     static int logs = 0;
     if (logs++ < 2) Log("STEREO eye %d pose composed on camera node %p", eye, node);
 }
@@ -1553,8 +1541,6 @@ void BeforeCameraBuild(void* cam) {
 // positions from depth) with a centre/union camera, so deferred shadows were reconstructed with a
 // camera that differs from the eye's → screen-anchored error → shadows slide with head motion.
 // The per-eye mismatch EXP-013 attributed to culling was fixed by the symmetric frustum (EXP-014).
-// 0.17.6 tried it ON again (mode 2) for "The Party": the owner saw parts of a house missing in the LEFT
-// eye with it. Back OFF.
 std::atomic<int> g_cullMode{0};
 std::atomic<bool> g_cullView{false};
 constexpr float kCullTanH = 1.6f, kCullTanV = 1.4f;  // ~116 x 109 degrees around the game camera
@@ -1655,17 +1641,7 @@ constexpr uint8_t kPublishView2Guard[] = {0x48, 0x83, 0xec, 0x48, 0x0f, 0x28, 0x
                                           0x28, 0x2d, 0x92, 0x39, 0x45, 0x01, 0x0f, 0x29};
 PublishFn g_publishView2 = nullptr;
 
-// 0.17.7 experiment (owner, "The Party": the eyes match with the head exactly centred and lose objects
-// with a tiny head move - per-eye room / portal visibility, INFERENCE). DAT_141c79002 = portal culling:
-// FUN_14086b540 sets it (on unless the camera's room is null, flagged +0x201 or has +0x118) right before
-// this setup, and the visibility passes read it (FUN_140996f80, FUN_1409a0e00). `portals off`: off for the
-// eye passes (everything in the frustum is drawn, walls still hide by depth); `portals on`: the game's.
-constexpr uint64_t kPortalCullingVa = 0x141c79002;
-std::atomic<bool> g_portalsOff{false};
-
 uint64_t HookVpSetup(void* vp, void* cmdbuf) {
-    if (g_portalsOff && g_recordingEye >= 0 && g_recordingEye <= 1)
-        if (const uintptr_t f = game::Va(kPortalCullingVa)) *reinterpret_cast<uint8_t*>(f) = 0;
     ++g_inVpSetup;
     const uint64_t r = g_origVpSetup(vp, cmdbuf);
     --g_inVpSetup;
@@ -1803,10 +1779,6 @@ void InstallCullView() {
 void AfterCameraBuild(void* cam) {
     const int eye = g_recordingEye;
     if (eye < 0 || eye > 1 || !g_haveXrEyes || !IsStereoCam(cam)) return;
-    if (g_engineFov && g_engineFovMode == 2 && !g_engineFovBuilt) {
-        g_engineFovBuilt = true;
-        RestoreEngineFov();  // early mode: the game's scalars for the rest of the pass
-    }
     const xr::EyeView& ev = g_xrEyes[eye];
     if (g_eyePoseMode == 2 && !g_viewCarriesEye) {
         // Mode 2: the node carried the head centre; V_eye = V_centre * centreRel * inverse(eyeRel).
@@ -1983,10 +1955,8 @@ bool Command(const char* verb, const char* arg) {
         else g_skipStages &= ~bit;
         Log("STEREO %s %s", v.c_str(), (g_skipStages.load() & bit) ? "OFF" : "on");
     } else if (v == "enginefov") {
-        g_engineFov = std::strcmp(arg, "off") != 0;
-        g_engineFovMode = std::strcmp(arg, "on") == 0 ? 1 : std::strcmp(arg, "late") == 0 ? 3 : 2;
-        Log("STEREO enginefov=%d mode=%d (1 whole pass, 2 early, 3 late)", int(g_engineFov.load()),
-            g_engineFovMode.load());
+        g_engineFov = std::strcmp(arg, "on") == 0;
+        Log("STEREO enginefov=%d", int(g_engineFov.load()));
     } else if (v == "symfov") {
         xr::SetSymmetricFov(std::strcmp(arg, "on") == 0);
         Log("STEREO symfov=%s", arg);
@@ -1994,9 +1964,6 @@ bool Command(const char* verb, const char* arg) {
         g_cullView = std::strcmp(arg, "off") != 0;
         g_cullMode = std::strcmp(arg, "off") == 0 ? 0 : std::strcmp(arg, "center") == 0 ? 1 : 2;
         Log("STEREO cullview mode=%d (0 off, 1 centre, 2 game-anchored)", g_cullMode.load());
-    } else if (v == "portals") {
-        g_portalsOff = std::strcmp(arg, "off") == 0 && game::Va(kPortalCullingVa);
-        Log("STEREO portal culling in the eye passes: %s", g_portalsOff ? "OFF" : "the game's");
     } else if (v == "eyesame") {
         g_eyeSame = std::strcmp(arg, "on") == 0;
         Log("STEREO eyesame=%d", int(g_eyeSame.load()));

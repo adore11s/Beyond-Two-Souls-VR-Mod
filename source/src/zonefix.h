@@ -15,8 +15,7 @@ void Frame();
 
 // Game thread, around each eye pass of the drawn list: the stereo cameras' room is set to the room the
 // eye is in for the pass, then put back.
-// `eye` 0 / 1 (logs when the two eye passes of a frame start from different camera rooms, 0.17.3).
-void BeginPass(void* const* cams, int count, int eye);
+void BeginPass(void* const* cams, int count);
 void EndPass();
 
 bool Command(const char* verb, const char* arg);
