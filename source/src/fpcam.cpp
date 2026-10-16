@@ -48,6 +48,14 @@ bool g_baseValid = false;
 // 6 cm / 0 and put the view at the base of the skull). b2svr.ini fp_eye_fwd / fp_eye_up.
 float g_viewYaw = 0.f, g_eyeForward = 0.09f, g_eyeUp = 0.07f;
 float g_wristPitch = 0.f;  // radians; b2svr.ini fp_wrist_pitch (degrees)
+// F1 right-stick turning: smooth (default) or snap steps. b2svr.ini turn=smooth|snap and
+// snap_turn_degrees (the launcher asks); dev verb "turn smooth|snap [degrees]".
+// The headset eye in the world (Jodie's eye base + your head), for the room the eye is in (zonefix).
+float g_eyeWorld[3] = {};
+bool g_eyeWorldValid = false;
+bool g_snapTurn = false;
+float g_snapStep = 0.78539816f;  // radians (45 deg)
+fp::SnapTurn g_snap;
 uint64_t g_lastFrame = 0, g_lastAnchor = 0;
 int g_implausibleEyeFrames = 0;
 fp::Mode g_lastMode = fp::Mode::Cinematic;
@@ -87,6 +95,10 @@ void ReadSettings() {
     g_eyeForward = number(L"fp_eye_fwd", g_eyeForward, -0.3f, 0.4f);
     g_eyeUp = number(L"fp_eye_up", g_eyeUp, -0.3f, 0.4f);
     g_wristPitch = number(L"fp_wrist_pitch", 0.f, -90.f, 90.f) * 0.017453293f;
+    GetPrivateProfileStringW(L"b2svr", L"turn", L"smooth", value, 32, path);
+    g_snapTurn = _wcsicmp(value, L"snap") == 0;
+    g_snapStep = number(L"snap_turn_degrees", 45.f, 10.f, 90.f) * 0.017453293f;
+    Log("FP turning in F1: %s", g_snapTurn ? "snap" : "smooth");
 }
 
 // ---- EXP-031 discovery: which gameplay controller updates run (walking vs cutscene vs Aiden) ----
@@ -343,6 +355,14 @@ void Frame() {
 std::atomic<bool> g_cutsceneFirstPerson{false}, g_firstPersonDrawn{false};
 bool CutsceneFirstPerson() { return g_cutsceneFirstPerson.load(std::memory_order_relaxed); }
 bool FirstPersonDrawn() { return g_firstPersonDrawn.load(std::memory_order_relaxed); }
+bool EyeWorld(float out[3]) {
+    std::lock_guard lock(g_stateMutex);
+    if (!g_eyeWorldValid) return false;
+    out[0] = g_eyeWorld[0];
+    out[1] = g_eyeWorld[1];
+    out[2] = g_eyeWorld[2];
+    return true;
+}
 
 
 void Suspend() {
@@ -350,6 +370,7 @@ void Suspend() {
     g_cutsceneFirstPerson = false;
     g_firstPersonDrawn = false;
     g_baseValid = false;
+    g_eyeWorldValid = false;
     g_cameraNode = nullptr;
     g_lastMode = fp::Mode::Cinematic;
     g_lastFrame = 0;
@@ -556,8 +577,15 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     // turned the view. While the game shows in-world prompts the stick is the game's only.
     const auto& right = input.hand[1];
     const bool promptsShowing = prompts::Showing(now);
-    if (kind == fp::BehaviourClass::Gameplay && right.active && std::fabs(right.stick[0]) > 0.25f && !promptsShowing)
-        g_viewYaw -= right.stick[0] * 2.0943951f * dt;
+    if (kind == fp::BehaviourClass::Gameplay && right.active && !promptsShowing) {
+        if (!g_snapTurn) {
+            if (std::fabs(right.stick[0]) > 0.25f) g_viewYaw -= right.stick[0] * 2.0943951f * dt;
+        } else if (const int step = g_snap.Step(right.stick[0], dt)) {
+            g_viewYaw -= float(step) * g_snapStep;
+        }
+    } else {
+        g_snap.Block();  // a stick held through prompts or a cutscene does not snap when it ends
+    }
     {
         static bool reported = false;
         if (promptsShowing != reported && kind == fp::BehaviourClass::Gameplay) {
@@ -725,21 +753,25 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
             // bone (M_Head) is not her face on these rigs - the face is the LC_M_Head group, and LIVE the two
             // disagree ("eyes behind her head") - so a view carried by M_Head can miss a turn of the face. Her
             // facing is square to the line between her eyes: that line stays level when she looks down (where
-            // head -> eyes went vertical and noisy) and needs no calibration. Of its two sides, the one nearer
-            // the current view (on entry: the calibrated one) is her front - a face cannot flip 180 deg between
-            // frames. Up / down still comes from the head bone.
+            // head -> eyes went vertical and noisy) and needs no calibration. Which of its two sides is her
+            // front comes from the face itself (fp::FaceFront, 0.17.1: "the side nearer the current view"
+            // turned the view to her back once the view had drifted). Up / down still comes from the head bone.
             if (faceRead) {
-                const pose::Vec3 across = fp::Sub(faceR, faceL);
-                const float flat = std::sqrt(across.x * across.x + across.z * across.z);
-                if (flat > 0.01f && flat > 0.5f * fp::Len(across)) {
-                    const float side = std::atan2(-across.z, across.x);
-                    const float ref = entering ? look : g_viewYaw;
-                    const float other = std::remainder(side + 3.14159265f, 6.28318531f);
-                    look = std::fabs(std::remainder(side - ref, 6.28318531f)) <= std::fabs(std::remainder(other - ref, 6.28318531f))
-                               ? side
-                               : other;
-                    if (entering) Log("FP F3 facing from her eye line: %.0f deg (calibrated view %.0f)", look * 57.29578f,
-                                      ref * 57.29578f);
+                const float ref = entering ? look : g_viewYaw;
+                float face = 0.f;
+                bool fromFace = false;
+                if (fp::FaceFront(faceL, faceR, faceHead, ref, bodyFront, &face, &fromFace)) {
+                    look = face;
+                    if (entering)
+                        Log("FP F3 facing from her eye line: %.0f deg (%s; calibrated view %.0f)", look * 57.29578f,
+                            fromFace ? "front from her face" : "side nearer the view", ref * 57.29578f);
+                    static uint64_t lastFlipLog = 0;
+                    if (!entering && std::fabs(std::remainder(look - g_viewYaw, 6.28318531f)) > 1.5708f &&
+                        now - lastFlipLog >= 2000) {
+                        lastFlipLog = now;
+                        Log("FP F3 her face is %.0f deg from the view: the view turns to her front (the old rule kept her back)",
+                            std::remainder(look - g_viewYaw, 6.28318531f) * 57.29578f);
+                    }
                 }
             }
             // 0.16.40 (owner on 0.16.34 - 0.16.39: up / down still inverted at times in F3). Up / down comes
@@ -846,6 +878,10 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     plan.moveStick = input.hand[0].active && std::hypot(input.hand[0].stick[0], input.hand[0].stick[1]) > 0.2f;
     plan.wristPitch = g_wristPitch;
     const pose::Mat4 headWorld = pose::Mul(input.headRel, g_base);
+    g_eyeWorld[0] = headWorld.m[12];
+    g_eyeWorld[1] = headWorld.m[13];
+    g_eyeWorld[2] = headWorld.m[14];
+    g_eyeWorldValid = fp::Finite({headWorld.m[12], headWorld.m[13], headWorld.m[14]});
     vrinput::Publish(input, kind == fp::BehaviourClass::Gameplay,
                      fp::YawOf(headWorld) - fp::YawOf(authoredCamera));
     // Smoothed body heading (owner: "stuttering of body when I turn"): the drawn body used to snap
@@ -1001,6 +1037,14 @@ bool Command(const char* verb, const char* arg) {
     if (std::strcmp(verb, "fpwrist") == 0 && arg) {
         g_wristPitch = std::clamp(static_cast<float>(std::atof(arg)), -90.f, 90.f) * 0.017453293f;
         Log("FP wrist pitch=%.1f deg", g_wristPitch * 57.29578f);
+        return true;
+    }
+    if (std::strcmp(verb, "turn") == 0 && arg) {
+        // "turn smooth" / "turn snap [degrees]"
+        g_snapTurn = std::strncmp(arg, "snap", 4) == 0;
+        if (g_snapTurn && arg[4] == ' ') g_snapStep = std::clamp(float(std::atof(arg + 5)), 10.f, 90.f) * 0.017453293f;
+        g_snap = {};
+        Log("FP turning in F1: %s (%.0f deg steps)", g_snapTurn ? "snap" : "smooth", g_snapStep * 57.29578f);
         return true;
     }
     if (std::strcmp(verb, "fpcount") == 0) {

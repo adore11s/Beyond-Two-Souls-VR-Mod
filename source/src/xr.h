@@ -92,6 +92,8 @@ bool GetInteractionProfile(int hand, char* output, uint32_t capacity);
 
 // Diagnostics: save the next UI capture (colour + alpha); put an opaque known image on the quad.
 void RequestUiShot();
+// Game thread, right before ResizeBuffers (render thread idle): drop the backbuffer view.
+void ReleaseBackbufferViews();
 void RequestFlatShot();  // next 2D-only frame: save the panel source and the backdrop eye image
 void SetUiTestPattern(int mode);
 // UI panel alpha: 3 (default) brightness coverage, drops black overlays such as cutscene

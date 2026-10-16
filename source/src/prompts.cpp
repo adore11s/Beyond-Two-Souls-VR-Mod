@@ -10,6 +10,7 @@
 
 #include "fp_math.h"
 #include "fpbody.h"
+#include "fpcam.h"
 #include "game.h"
 #include "log.h"
 
@@ -267,6 +268,139 @@ void HookUpdateRecord(void* record) {
             fp::Len(fromHead));
 }
 
+// Button prompts in F3 (0.17.2, owner live in _1401_EMBASSY: "the HOLD and LB prompt should face in front of me
+// in F3 like the Clayton prompt"; it is drawn in the 3D pass, the 2D layer was empty). STATIC (EXP-040 0.16.34,
+// re-verified): the button / stick prompts (MPAR_ELEMENT_HOLD, STANDARD, MASH, AXIS_*) are each a small
+// MenusMaster menu (FUN_140fa4e00(element)+0x148), drawn in the world while its byte +6 is set at its matrix
+// +0x30..+0x6c (rows X / Y / Z / position). FUN_140e46850 (MPAR_GUI, per element; entry +0x10 element, +0x18
+// that menu) builds that matrix at the object or bone the prompt is about, turned toward the GAME camera - in F3
+// the shot camera, not the eye - and stores a copy in the element for game logic (+0x200). In F3 the menu's
+// copy only is replaced after the call: in front of the view (5 deg above the gaze; the white dots sit below it),
+// at the distance it had from the eye (0.7 - 2 m, so it keeps its drawn size), facing the view, world-locked and
+// placed again when new, unseen for 0.5 s, 35 deg off the gaze or much nearer / further. The white dots
+// (MPAR_ELEMENT_ICONIC) keep their own handling (HookUpdateRecord).
+constexpr uint64_t kPlaceElementVa = 0x140e46850;
+constexpr uint64_t kIconicVtableVa = 0x14179d130;  // QDT::SINT::MPAR_ELEMENT_ICONIC
+constexpr size_t kEntryElement = 0x10, kEntryMenu = 0x18, kMenu3D = 6, kMenuMatrix = 0x30;
+constexpr float kPromptMinDistance = 0.7f, kPromptMaxDistance = 2.0f, kPromptLift = 0.0873f;  // 5 deg
+using PlaceElementFn = void (*)(void* gui, void* entry);
+PlaceElementFn g_placeOriginal = nullptr;
+uintptr_t g_iconicVt = 0;
+struct Placed {
+    uint8_t* menu = nullptr;
+    float m[16]{};
+    float distance = 0.f;
+    uint64_t seen = 0;
+};
+Placed g_placed[8];
+std::atomic<uint64_t> g_promptsPlaced{0};
+
+// Rows X = view right, Y = up, Z = X x Y (toward the eye; engine right-handed, -Z forward), each keeping its
+// length (the menu's scale). FUN_140c27690 builds the prompts' turn-to-camera matrix the same way (Z row =
+// from the prompt toward what it faces).
+void FaceView(float m[16], pose::Vec3 fwd) {
+    const float len = std::sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
+    if (!(len > 1e-3f)) return;
+    const pose::Vec3 right{-fwd.z / len, 0.f, fwd.x / len}, up{0.f, 1.f, 0.f};
+    const pose::Vec3 rows[3] = {right, up, fp::Cross(right, up)};
+    for (int r = 0; r < 3; ++r) {
+        float scale = fp::Len(pose::Vec3{m[r * 4], m[r * 4 + 1], m[r * 4 + 2]});
+        if (!std::isfinite(scale) || scale < 1e-3f) scale = 1.f;
+        m[r * 4] = rows[r].x * scale;
+        m[r * 4 + 1] = rows[r].y * scale;
+        m[r * 4 + 2] = rows[r].z * scale;
+    }
+}
+
+// The entry's menu (only while drawn in 3D) and the element's class.
+bool ReadPrompt(void* entry, uint8_t** menu, float m[16], uintptr_t* elementVt) {
+    __try {
+        const uint8_t* e = static_cast<uint8_t*>(entry);
+        const uint8_t* element = *reinterpret_cast<uint8_t* const*>(e + kEntryElement);
+        *elementVt = element ? *reinterpret_cast<const uintptr_t*>(element) : 0;
+        *menu = *reinterpret_cast<uint8_t* const*>(e + kEntryMenu);
+        if (!*menu || !(*menu)[kMenu3D]) return false;
+        std::memcpy(m, *menu + kMenuMatrix, 64);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool WritePrompt(uint8_t* menu, const float m[16]) {
+    __try {
+        std::memcpy(menu + kMenuMatrix, m, 64);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Diagnostic: every 3D prompt menu seen in first person, once (its class, where it was).
+uint8_t* g_promptsSeen[32]{};
+uint32_t g_promptsSeenCount = 0;
+bool FirstSight(uint8_t* menu) {
+    for (uint32_t i = 0; i < g_promptsSeenCount; ++i)
+        if (g_promptsSeen[i] == menu) return false;
+    if (g_promptsSeenCount >= std::size(g_promptsSeen)) return false;
+    g_promptsSeen[g_promptsSeenCount++] = menu;
+    return true;
+}
+
+void HookPlaceElement(void* gui, void* entry) {
+    g_placeOriginal(gui, entry);
+    uint8_t* menu = nullptr;
+    float m[16];
+    uintptr_t vt = 0;
+    pose::Vec3 head, eye, fwd;
+    if (!g_enabled.load(std::memory_order_relaxed) || !entry || !ReadPrompt(entry, &menu, m, &vt) ||
+        !fpbody::PromptView(&head, &eye, &fwd))
+        return;
+    const pose::Vec3 anchor{m[12], m[13], m[14]};
+    if (!fp::Finite(anchor)) return;
+    const bool iconic = g_iconicVt && vt == g_iconicVt;
+    const bool f3 = fpcam::CutsceneFirstPerson();
+    if (FirstSight(menu))
+        Log("PROMPTS 3D prompt %p (%s, class vt 0x%llx) %.2f m from the eye in %s -> %s", static_cast<void*>(menu),
+            iconic ? "white dot" : "button prompt",
+            static_cast<unsigned long long>(vt ? vt - game::ModuleBase() + 0x140000000ull : 0),
+            fp::Len(fp::Sub(anchor, eye)), f3 ? "F3" : "F1",
+            !iconic && f3 ? "in front of the view, facing it" : "left where the game puts it");
+    if (iconic || !f3) return;
+    fwd = fp::Norm(fwd);
+    const uint64_t now = GetTickCount64();
+    Placed* slot = nullptr;
+    for (auto& p : g_placed)
+        if (p.menu == menu) {
+            slot = &p;
+            break;
+        }
+    if (!slot)
+        for (auto& p : g_placed)
+            if (!slot || p.seen < slot->seen) slot = &p;  // free or least recently seen
+    bool place = slot->menu != menu || now - slot->seen > 500;
+    if (!place) {
+        const pose::Vec3 to = fp::Sub(pose::Vec3{slot->m[12], slot->m[13], slot->m[14]}, eye);
+        const float d = fp::Len(to);
+        place = d < 0.45f * slot->distance || d > 1.7f * slot->distance ||
+                fp::Dot(fp::Mul(to, 1.f / std::max(d, 1e-3f)), fwd) < std::cos(0.6109f);  // 35 deg
+    }
+    if (place) {
+        const float fromEye = fp::Len(fp::Sub(anchor, eye));
+        const float viewYaw = std::atan2(-fwd.x, -fwd.z);
+        const float pitch = std::asin(std::clamp(fwd.y, -0.95f, 0.95f)) + kPromptLift;
+        const pose::Vec3 dir{-std::sin(viewYaw) * std::cos(pitch), std::sin(pitch), -std::cos(viewYaw) * std::cos(pitch)};
+        slot->menu = menu;
+        slot->distance = std::clamp(fromEye, kPromptMinDistance, kPromptMaxDistance);
+        std::memcpy(slot->m, m, sizeof(slot->m));
+        FaceView(slot->m, fwd);
+        const pose::Vec3 at = fp::Add(eye, fp::Mul(dir, slot->distance));
+        slot->m[12] = at.x;
+        slot->m[13] = at.y;
+        slot->m[14] = at.z;
+        if (g_promptsPlaced.fetch_add(1, std::memory_order_relaxed) < 8)
+            Log("PROMPTS button prompt %p placed in front of the view, facing it: %.2f m (it was %.2f m from the eye)",
+                static_cast<void*>(menu), slot->distance, fromEye);
+    }
+    slot->seen = now;
+    WritePrompt(menu, slot->m);
+}
+
 }  // namespace
 
 void SetEnabled(bool on) {
@@ -309,6 +443,17 @@ bool Install() {
             Log("PROMPTS dialogue / thoughts anchor hook FAILED");
     } else {
         Log("PROMPTS dialogue anchor not found in this build: dialogue choices stay where the game puts them");
+    }
+    g_iconicVt = game::Va(kIconicVtableVa);
+    if (void* place = reinterpret_cast<void*>(game::Va(kPlaceElementVa)); place && g_iconicVt) {
+        if (MH_CreateHook(place, reinterpret_cast<void*>(&HookPlaceElement), reinterpret_cast<void**>(&g_placeOriginal)) ==
+                MH_OK &&
+            MH_EnableHook(place) == MH_OK)
+            Log("PROMPTS button prompt placement hook installed (F3: in front of the view)");
+        else
+            Log("PROMPTS button prompt placement hook FAILED");
+    } else {
+        Log("PROMPTS button prompt placement not found in this build: button prompts stay where the game puts them");
     }
     return true;
 }

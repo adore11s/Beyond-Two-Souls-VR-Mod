@@ -38,6 +38,7 @@ The `ctest` suites are desk tests of the pose maths, the first-person rules, con
 | `fpcam.*`, `fpbody.*`, `player.*`, `bones.*`, `camdirector.*`, `fpmode.h`, `fp_math.h` | first person |
 | `vrinput.*`, `steam_shadow.h`, `vrinput_math.h` | VR controllers as a gamepad |
 | `pacing.*` | frame limiter and VSync |
+| `rendersize.*` | the square VR picture (`render_size`) |
 | `hotkeys.*` | F1 / F2 / F3 / F9 |
 | `crashreport.*`, `log.*`, `devctl.*` | crash reports, the log, development commands |
 

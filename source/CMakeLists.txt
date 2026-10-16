@@ -28,6 +28,7 @@ add_library(b2svr SHARED
     src/heapscan.cpp
     src/watchpoint.cpp
     src/sigdb.cpp
+    src/rendersize.cpp
     src/prompts.cpp
     src/videowatch.cpp
     src/zonefix.cpp

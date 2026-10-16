@@ -539,6 +539,18 @@ ID3D11Texture2D* FlatSource(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffe
     return g_flatTex;
 }
 
+// Drops an owned texture and its cached shader view (a size change needs a new one).
+void DropTexture(ID3D11Texture2D*& tex) {
+    if (!tex) return;
+    for (auto& e : g_srvCache)
+        if (e.tex == tex) {
+            if (e.srv) e.srv->Release();
+            e = {};
+        }
+    tex->Release();
+    tex = nullptr;
+}
+
 ID3D11RenderTargetView* BackbufferRtv(ID3D11Texture2D* bb) {
     if (g_bbForRtv != bb) {
         if (g_bbRtv) g_bbRtv->Release();
@@ -578,6 +590,9 @@ void Blit(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, uint32_t top, uint32_t
     ctx1->Draw(3, 0);
     ID3D11ShaderResourceView* nullSrv = nullptr;
     ctx1->PSSetShaderResources(0, 1, &nullSrv);
+    // The blit state object keeps whatever is bound in it: a target left bound there held the
+    // game's backbuffer, and ResizeBuffers then failed (DXGI_ERROR_INVALID_CALL, EXP-041).
+    ctx1->OMSetRenderTargets(0, nullptr, nullptr);
     ctx1->SwapDeviceContextState(previous, nullptr);
     if (previous) previous->Release();
     ctx1->Release();
@@ -918,6 +933,12 @@ std::atomic<bool> g_uiShotRequest{false};
 std::atomic<int> g_uiTestPattern{0};  // 0 off, 1 opaque test pattern on the quad (FAIL-HUD-010)
 std::atomic<int> g_uiAlphaMode{3};    // quad alpha: 2 coverage (keeps black overlays), 3 brightness
 void RequestUiShot() { g_uiShotRequest = true; }
+void ReleaseBackbufferViews() {
+    // ResizeBuffers fails while any view on the old backbuffer is alive (EXP-041).
+    if (g_bbRtv) g_bbRtv->Release();
+    g_bbRtv = nullptr;
+    g_bbForRtv = nullptr;
+}
 std::atomic<bool> g_flatShotRequest{false};
 void RequestFlatShot() { g_flatShotRequest = true; }
 void SetUiTestPattern(int mode) { g_uiTestPattern = mode; }
@@ -1417,6 +1438,13 @@ void OnUiEnd(int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID
     if (!p.valid || !g_frameOpen) return;
     D3D11_TEXTURE2D_DESC d{};
     backbuffer->GetDesc(&d);
+    if (g_uiTex) {
+        // The backbuffer changes size with the render size (b2svr.ini render_size): a copy between
+        // different sizes does nothing, and the panel would keep the old UI (FAIL-STR-054).
+        D3D11_TEXTURE2D_DESC ud{};
+        g_uiTex->GetDesc(&ud);
+        if (ud.Width != d.Width || ud.Height != d.Height || ud.Format != d.Format) DropTexture(g_uiTex);
+    }
     if (!g_uiTex) {
         D3D11_TEXTURE2D_DESC ud = d;
         ud.Usage = D3D11_USAGE_DEFAULT;

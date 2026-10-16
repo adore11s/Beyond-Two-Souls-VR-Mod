@@ -104,6 +104,64 @@ int main() {
         const pose::Vec3 up = pose::TransformPoint({0, 0, -1}, pose::FromPose(pq, {0, 0, 0}));
         Check(up.y > 0.4f && up.z < -0.8f, "positive pitch looks up");
     }
+    // F3 facing from her face: the eye line gives two sides, the face itself says which is front.
+    {
+        // Head bone at the origin; eyes 9 cm forward, 7 cm up, 3 cm apart, for facing yaw y and pitch p.
+        auto eyes = [](float y, float p, pose::Vec3* l, pose::Vec3* r) {
+            const float fy = 0.07f * std::cos(p) + 0.09f * std::sin(p), fz = 0.07f * std::sin(p) - 0.09f * std::cos(p);
+            // local mid (0, fy, fz) and right (1, 0, 0), turned by yaw (forward -Z, right +X at yaw 0)
+            const pose::Vec3 mid{fz * std::sin(y), fy, fz * std::cos(y)};
+            const pose::Vec3 right{std::cos(y), 0.f, -std::sin(y)};
+            *l = {mid.x - 0.03f * right.x, mid.y, mid.z - 0.03f * right.z};
+            *r = {mid.x + 0.03f * right.x, mid.y, mid.z + 0.03f * right.z};
+        };
+        const pose::Vec3 head{0.f, 0.f, 0.f};
+        pose::Vec3 l{}, r{};
+        float yaw = 0.f;
+        bool fromFace = false;
+        eyes(30 * deg, 0.f, &l, &r);
+        Check(FaceFront(l, r, head, 30 * deg, 30 * deg, &yaw, &fromFace) && Near(yaw, 30 * deg, 1e-3f) && fromFace,
+              "face front: level face at 30 deg");
+        Check(FaceFront(l, r, head, 190 * deg, 30 * deg, &yaw, &fromFace) && Near(yaw, 30 * deg, 1e-3f) && fromFace,
+              "the view drifted behind her: still her front (no flip)");
+        eyes(30 * deg, -60 * deg, &l, &r);
+        Check(FaceFront(l, r, head, 200 * deg, 30 * deg, &yaw, &fromFace) && Near(yaw, 30 * deg, 1e-3f),
+              "looking down 60 deg, view behind: her front");
+        eyes(30 * deg, 0.f, &l, &r);
+        Check(FaceFront(l, r, head, 0.f, 0.f, &yaw, &fromFace) && Near(yaw, 30 * deg, 1e-3f),
+              "head turned 30 deg from her body: her face wins");
+        // Stale face-rig data (0.16.9): eyes behind her head, body front the other way -> side nearest the view.
+        eyes(210 * deg, 0.f, &l, &r);
+        Check(FaceFront(l, r, head, 30 * deg, 30 * deg, &yaw, &fromFace) && Near(std::remainder(yaw - 30 * deg, 6.2831853f), 0.f, 1e-3f) &&
+                  !fromFace,
+              "eyes behind her head (stale): falls back to the side nearest the view");
+        // Eyes straight above the head bone: no forward from the face -> side nearest the view.
+        l = {-0.03f, 0.11f, 0.f};
+        r = {0.03f, 0.11f, 0.f};
+        Check(FaceFront(l, r, head, 175 * deg, 0.f, &yaw, &fromFace) && Near(std::remainder(yaw - 180 * deg, 6.2831853f), 0.f, 1e-3f) &&
+                  !fromFace,
+              "no forward from the face: side nearest the view");
+        l = {0.f, 0.05f, -0.09f};
+        r = {0.f, 0.11f, -0.09f};
+        Check(!FaceFront(l, r, head, 0.f, 0.f, &yaw, &fromFace), "vertical eye line: no facing");
+    }
+    // Snap turning: one step per push, repeats while held, re-arms at the centre.
+    {
+        SnapTurn s;
+        const float dt = 1.f / 90.f;
+        Check(s.Step(0.5f, dt) == 0, "half push does not snap");
+        Check(s.Step(0.9f, dt) == 1, "full push right -> one step right");
+        int extra = 0;
+        for (int i = 0; i < 20; ++i) extra += s.Step(0.9f, dt);  // ~0.22 s held
+        Check(extra == 0, "holding shorter than the repeat delay gives no second step");
+        for (int i = 0; i < 12; ++i) extra += s.Step(0.9f, dt);  // past 0.33 s
+        Check(extra == 1, "holding past the repeat delay steps again");
+        Check(s.Step(0.5f, dt) == 0 && s.Step(0.9f, dt) == 0, "back to half without centring: not re-armed");
+        Check(s.Step(0.1f, dt) == 0 && s.Step(-0.9f, dt) == -1, "centre, then full left -> one step left");
+        s.Block();
+        Check(s.Step(-0.9f, dt) == 0, "blocked (prompts): a stick already held does not snap");
+        Check(s.Step(0.f, dt) == 0 && s.Step(-0.8f, dt) == -1, "after centring it snaps again");
+    }
 
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;

@@ -84,6 +84,44 @@ inline bool PlausibleStep(const pose::Vec3& prev, const pose::Vec3& next, float 
     return std::sqrt(dx * dx + dy * dy + dz * dz) <= maxMetres;
 }
 
+// F3 facing from her face (0.17.1). Her facing is square to the line between her eyes (that line stays
+// level when she looks down). Which of its two sides is her front, the face itself says: head bone -> the
+// point between her eyes, made square to the eye line, points forward (and ~24 deg up when level), and
+// still points forward when she looks down. LIVE 0.17.0 (owner, demo, guitar scene, 114 s: "my view turned
+// backwards and I saw my back"): the old rule - the side nearer the current view - kept the back side once
+// the view had drifted more than 90 deg from her face (frames without a face reading follow the provisional
+// calibration, up to ~110 deg off). The side nearer `ref` is used only when the face gives no forward (eyes
+// straight above the head bone) or one more than 110 deg from her body's front (stale face-rig data put the
+// eyes behind her head once, 0.16.9). False when the eye line is too short or too steep.
+inline bool FaceFront(pose::Vec3 eyeL, pose::Vec3 eyeR, pose::Vec3 head, float ref, float bodyFront, float* yaw,
+                      bool* fromFace) {
+    const float ax = eyeR.x - eyeL.x, ay = eyeR.y - eyeL.y, az = eyeR.z - eyeL.z;
+    const float flat = std::sqrt(ax * ax + az * az), len = std::sqrt(ax * ax + ay * ay + az * az);
+    if (!(flat > 0.01f && flat > 0.5f * len)) return false;
+    const float side = std::atan2(-az, ax);
+    const float other = std::remainder(side + 3.14159265f, 6.28318531f);
+    float nx = (eyeL.x + eyeR.x) * 0.5f - head.x, ny = (eyeL.y + eyeR.y) * 0.5f - head.y,
+          nz = (eyeL.z + eyeR.z) * 0.5f - head.z;
+    const float along = (nx * ax + ny * ay + nz * az) / (len * len);
+    nx -= along * ax;
+    ny -= along * ay;
+    nz -= along * az;
+    const float nl = std::sqrt(nx * nx + ny * ny + nz * nz), nflat = std::sqrt(nx * nx + nz * nz);
+    if (nl > 1e-3f && nflat >= 0.25f * nl) {
+        const float front = -nx * std::sin(side) - nz * std::cos(side) >= 0.f ? side : other;
+        if (std::fabs(std::remainder(front - bodyFront, 6.28318531f)) <= 1.92f) {
+            *yaw = front;
+            if (fromFace) *fromFace = true;
+            return true;
+        }
+    }
+    *yaw = std::fabs(std::remainder(side - ref, 6.28318531f)) <= std::fabs(std::remainder(other - ref, 6.28318531f))
+               ? side
+               : other;
+    if (fromFace) *fromFace = false;
+    return true;
+}
+
 // Rising-edge detector for a polled key (GetAsyncKeyState high bit).
 struct Toggle {
     bool was = false;
@@ -91,6 +129,43 @@ struct Toggle {
         const bool edge = down && !was;
         was = down;
         return edge;
+    }
+};
+
+// Snap turning for F1 (owner 2026-10-15, b2svr.ini turn=snap). Playbook ch03: snap 45 deg is what
+// shipped VR mods default to, with a 0.25-0.33 s re-trigger delay. A push past `fire` turns one
+// step, holding it repeats every `repeat` seconds, and the stick must come back inside `rearm`
+// before a new push counts.
+struct SnapTurn {
+    bool armed = true;
+    float held = 0.f;
+    // -1, 0 or +1 steps, with the sign of the stick.
+    int Step(float x, float dt, float fire = 0.7f, float rearm = 0.35f, float repeat = 0.33f) {
+        const float a = std::fabs(x);
+        if (a < rearm) {
+            armed = true;
+            held = 0.f;
+            return 0;
+        }
+        if (a < fire) {
+            held = 0.f;
+            return 0;
+        }
+        const int dir = x > 0.f ? 1 : -1;
+        if (armed) {
+            armed = false;
+            held = 0.f;
+            return dir;
+        }
+        held += dt;
+        if (held < repeat) return 0;
+        held -= repeat;
+        return dir;
+    }
+    // The stick belongs to something else (prompts): it has to be centred before the next step.
+    void Block() {
+        armed = false;
+        held = 0.f;
     }
 };
 

@@ -15,6 +15,7 @@ Everything beyond the basics in the [README](README.md).
 ## What the mod does
 
 - **Real stereo 3D.** Every frame is drawn twice, once per eye, with full head tracking (turning and leaning).
+- **A square picture for each eye.** While VR runs the game draws a square picture (the size you pick in the launcher, `render_size`) instead of its 16:9 one, whatever your monitor's resolution. Needs the game in **Windowed** mode; in its other display modes the mod leaves the game's own resolution.
 - **The game's own cameras stay in charge.** In third person your head moves on top of the camera the game chose, so scenes keep their framing.
 - **The game's interface** (prompts, subtitles, HUD) floats in front of you as a separate layer.
 - **Menus, videos and loading screens** show on a big screen floating in front of you.
@@ -93,7 +94,7 @@ On Steam copies the controllers appear as a Steam Input gamepad. On copies witho
 | Control | Does |
 |---|---|
 | Left stick | Walk where you are looking |
-| Right stick left / right | Turn (not while white-dot prompts are on screen: then the stick only does the prompt) |
+| Right stick left / right | Turn: smoothly, or in 45-degree steps with snap turning (the launcher asks; `turn` in `b2svr.ini`). Not while white-dot prompts are on screen: then the stick only does the prompt |
 | Your hands | Jodie's hands follow your controllers |
 
 When the game switches to a filtered camera view (for example the security cameras in the DPA rooms when Jodie stands still), first person steps aside and shows the game's camera, then comes back by itself. F3 does the same while Jodie is not animated (standing in a T-pose between scenes).
@@ -112,6 +113,10 @@ When the game switches to a filtered camera view (for example the security camer
 | `xr` | on | off = start on the monitor and press F9 for VR |
 | `fps` | 0 | Frame rate cap; 0 = none (recommended in VR) |
 | `vsync` | off | Monitor VSync; always off while VR runs |
+| `render_size` | 2048 | VR picture size: a square of this many pixels per side for each eye while VR runs (the launcher asks: 1440 / 1728 / 2048 / 2304 / 2560 / 2816); off = the game's own resolution. Needs the game in Windowed mode |
+| `desktop_window` | 720 | While the square VR picture runs, the game window on your monitor is this many pixels square (the headset still gets the full picture); 0 = the game's own window size |
+| `turn` | smooth | Right-stick turning in first person (F1): smooth or snap (the launcher asks) |
+| `snap_turn_degrees` | 45 | Snap turning step in degrees |
 | `firstperson` | off | on = start with F1 first person switched on |
 | `fpcutscenes` | off | on = start with F3 first person in cutscenes switched on |
 | `fparms` | on | off = Jodie's arms stay animated by the game in first person |
@@ -142,9 +147,12 @@ Nothing in the game is replaced, patched or edited on disk.
 
 ## Known limitations
 
+- **The Party level is drawn wrong in VR.** Objects, shadows and the door go missing, and sometimes the whole picture turns plain blue or black, mostly around the house you can walk into. Press **F9** to play this level on your monitor and **F9** again afterwards to go back to VR.
+- **Subtitles can be cut off at the bottom** with the square VR picture.
 - **First person is still being tuned.** The view height, hand positions and wrist angles may be off in some scenes: adjust them with `fp_eye_fwd`, `fp_eye_up` and `fp_wrist_pitch` in `b2svr.ini`. Press F1 / F3 again to go back to the game's cameras at any time.
 - **Cinematic framing.** Some cutscenes keep the game's widescreen framing.
-- **Performance.** The game is drawn twice per frame; lower the game's graphics settings if the headset stutters.
+- **Performance.** The game is drawn twice per frame; pick a smaller VR picture size in the launcher, or lower the game's graphics settings, if the headset stutters.
+- **The game window on your monitor is small** while VR runs (`desktop_window`, 720 x 720 by default): the headset gets the full square picture, the monitor only a preview.
 
 ---
 
@@ -155,6 +163,9 @@ Nothing in the game is replaced, patched or edited on disk.
 - Open `b2svr_logs\b2svr.log` in the game folder:
   - `FAIL-CLOSED` means the mod could not find the game's core VR addresses in your build (see Supported game versions); the `SIGDB` lines above it name what is missing;
   - `xrCreateInstance failed` means no VR runtime answered. The mod keeps trying every 5 seconds.
+
+**The headset picture is blurry or the game renders 16:9**
+In the game's graphics settings, set the display mode to **Windowed**. In its other modes the game sizes its picture from your desktop, so the mod keeps the game's own resolution (`RENDERSIZE ... needs the game in Windowed mode` in `b2svr_logs\b2svr.log`).
 
 **SteamVR restarted or crashed while playing**
 The mod falls back to the monitor and keeps trying to reconnect every 5 seconds. If VR does not come back, press **F9** twice or restart the game.

@@ -20,6 +20,7 @@
 #include "log.h"
 #include "pacing.h"
 #include "probe.h"
+#include "rendersize.h"
 #include "stereo.h"
 
 namespace b2s::devctl {
@@ -146,7 +147,8 @@ void Execute(const std::string& line, IDXGISwapChain* sc) {
         crash::WriteTestReport();
     } else if (v == "log") {
         Log("DEVCTL mark: %s", line.c_str() + 4);
-    } else if (!stereo::Command(verb, arg) && !fpcam::Command(verb, arg) && !zonefix::Command(verb, arg) && !pacing::Command(verb, arg) && !probe::Command(verb, arg)) {
+    } else if (!stereo::Command(verb, arg) && !fpcam::Command(verb, arg) && !zonefix::Command(verb, arg) && !pacing::Command(verb, arg) && !probe::Command(verb, arg) &&
+               !rendersize::Command(verb, arg)) {
         Log("DEVCTL unknown command '%s'", line.c_str());
     }
 }

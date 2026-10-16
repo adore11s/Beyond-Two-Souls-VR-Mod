@@ -39,6 +39,9 @@ void OnPresent(IDXGISwapChain* sc);
 // the flat mirror and end the XR frame.
 void BeforePresent();
 
+// VR requested (b2svr.ini xr=on, F9 or the "xr on" verb), whether or not the session runs yet.
+bool XrWanted();
+
 // devctl verbs: "stereo on|off", "ipd <m>", "suppress on|off", "sshot <name>", "xr on|off", "recenter".
 bool Command(const char* verb, const char* arg);
 

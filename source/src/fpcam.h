@@ -24,6 +24,8 @@ void EndRender();
 bool CutsceneFirstPerson();
 // True while first person (F1 or F3) is drawn.
 bool FirstPersonDrawn();
+// The headset eye's world position in first person (last prepared frame); false outside first person.
+bool EyeWorld(float out[3]);
 
 
 // Crash report line: F1/F3 settings and the current mode. Lock-free (may run in a crashed process).

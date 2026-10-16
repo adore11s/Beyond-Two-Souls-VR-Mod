@@ -236,6 +236,78 @@ function Test-KnownBuild([string]$game) {
     return @{ Known = ($id.TimeStamp -eq $KnownTimeStamp -and $id.Size -eq $KnownImageSize); Id = $id }
 }
 
+# ---- b2svr.ini ------------------------------------------------------------------------------------
+# One key of the [b2svr] section. Every other line is kept as it is; the file may mix CRLF and LF
+# line ends, so lines are split on either and written back with CRLF.
+function Get-IniValue([string]$path, [string]$key) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    foreach ($line in ([IO.File]::ReadAllText($path) -split "\r?\n")) {
+        if ($line -match ('^\s*' + [regex]::Escape($key) + '\s*=\s*(.*?)\s*$')) { return $Matches[1] }
+    }
+    return $null
+}
+function Set-IniValue([string]$path, [string]$key, [string]$value) {
+    $text = ''
+    if (Test-Path -LiteralPath $path) { $text = [IO.File]::ReadAllText($path) }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($l in ($text -split "\r?\n")) { $lines.Add($l) }
+    while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+    $section = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[b2svr\]\s*$') { $section = $i; break } }
+    if ($section -lt 0) { $lines.Add('[b2svr]'); $section = $lines.Count - 1 }
+    $end = $lines.Count   # the next section starts here
+    for ($i = $section + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[') { $end = $i; break } }
+    $set = $false
+    for ($i = $section + 1; $i -lt $end; $i++) {
+        if ($lines[$i] -match ('^\s*' + [regex]::Escape($key) + '\s*=')) { $lines[$i] = "$key=$value"; $set = $true; break }
+    }
+    if (-not $set) { $lines.Insert($end, "$key=$value") }
+    [IO.File]::WriteAllText($path, (($lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding $false))
+}
+
+# The VR settings asked on every Play (just Enter keeps the current choice).
+$RenderSizes = @(1440, 1728, 2048, 2304, 2560, 2816)
+$RenderNotes = @('fastest', '', 'recommended', '', '', 'sharpest')
+function Select-VrSettings([string]$ini) {
+    Write-Host ''
+    Say 'VR picture size: a square picture for each eye, in pixels.'
+    Say 'Bigger = sharper, but it needs a faster graphics card.'
+    $current = Get-IniValue $ini 'render_size'
+    $default = 3
+    for ($i = 0; $i -lt $RenderSizes.Count; $i++) { if ("$($RenderSizes[$i])" -eq $current) { $default = $i + 1 } }
+    for ($i = 0; $i -lt $RenderSizes.Count; $i++) {
+        $note = ''
+        if ($RenderNotes[$i]) { $note = '   (' + $RenderNotes[$i] + ')' }
+        Write-Host ('     {0}. {1} x {1}{2}' -f ($i + 1), $RenderSizes[$i], $note)
+    }
+    $a = "$(Ask "Type 1-6 and press Enter (just Enter keeps $default)" "$default")".Trim()
+    if (-not $a) { $a = "$default" }
+    $n = 0
+    if (-not [int]::TryParse($a, [ref]$n) -or $n -lt 1 -or $n -gt $RenderSizes.Count) {
+        Warn "'$a' is not 1-6: keeping $default"
+        $n = $default
+    }
+    $size = $RenderSizes[$n - 1]
+    Set-IniValue $ini 'render_size' "$size"
+    Say "VR picture size: $size x $size"
+
+    Write-Host ''
+    Say 'Turning with the right stick in first person (F1):'
+    Write-Host '     1. Smooth turning'
+    Write-Host '     2. Snap turning (turns in steps)'
+    $default = 1
+    if ((Get-IniValue $ini 'turn') -eq 'snap') { $default = 2 }
+    $a = "$(Ask "Type 1 or 2 and press Enter (just Enter keeps $default)" "$default")".Trim()
+    if (-not $a) { $a = "$default" }
+    if ($a -ne '1' -and $a -ne '2') {
+        Warn "'$a' is not 1 or 2: keeping $default"
+        $a = "$default"
+    }
+    if ($a -eq '2') { $turn = 'snap' } else { $turn = 'smooth' }
+    Set-IniValue $ini 'turn' $turn
+    Say "Turning in first person: $turn"
+}
+
 # ---- starting things ------------------------------------------------------------------------------
 function Start-Game([string]$game) {
     $id = Get-SteamAppId $game
@@ -278,7 +350,10 @@ function Show-Status([string]$game) {
             (Get-FileHash -LiteralPath $dll).Hash -eq (Get-FileHash -LiteralPath (Join-Path $Files 'dinput8.dll')).Hash) {
         Say 'dinput8.dll: this release is installed'
     } else { Say 'dinput8.dll: an older or newer build of this mod is installed' }
-    if (Test-Path -LiteralPath (Join-Path $game 'b2svr.ini')) { Say 'b2svr.ini: present' } else { Say 'b2svr.ini: not created yet' }
+    $ini = Join-Path $game 'b2svr.ini'
+    if (Test-Path -LiteralPath $ini) {
+        Say ('b2svr.ini: present (VR picture size {0}, turning {1})' -f (Get-IniValue $ini 'render_size'), (Get-IniValue $ini 'turn'))
+    } else { Say 'b2svr.ini: not created yet' }
     $reports = Join-Path $game 'b2svr_logs\crash_reports'
     if (Test-Path -LiteralPath $reports) {
         $n = @(Get-ChildItem -LiteralPath $reports -Filter 'crash_*.txt' -ErrorAction SilentlyContinue).Count
@@ -369,7 +444,10 @@ if ($Mode -eq 'Play') {
     } else {
         Say 'b2svr.ini: your VR settings kept'
     }
+    Select-VrSettings $ini
 
+    Write-Host ''
+    Say 'In the game''s graphics settings: Windowed mode, Motion blur off, Depth of field off.'
     Write-Host ''
     Say 'In the game:'
     Say '  - VR starts by itself a few seconds after the game starts'
