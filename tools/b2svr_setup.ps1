@@ -337,6 +337,74 @@ function Start-SteamVRIfNeeded {
     }
 }
 
+# ---- removing this B2S_VR_MOD folder (uninstall) --------------------------------------------------
+# Deletes only the files the release shipped (tools\release_files.txt) and the installer's own state;
+# a folder goes only once it is empty, never with what is inside it. Anything else kept here stays,
+# and so does the folder. When this folder is the game folder or holds a game exe (the release
+# unpacked straight into the game folder), nothing here is deleted.
+$Manifest = Join-Path $PSScriptRoot 'release_files.txt'
+$RunningCmd = 'Uninstall VR mod.cmd'   # cmd.exe still reads it: deleted after this script exits
+$StateFiles = @('game_dir.txt', 'setup_log.txt', 'setup_log.prev.txt')
+
+function Test-InsideModDir([string]$path) {
+    $root = [IO.Path]::GetFullPath($ModDir).TrimEnd('\') + '\'
+    return [IO.Path]::GetFullPath($path).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+}
+
+# Returns $true when the rest (the running .cmd, the setup logs, the folder if empty) may go once
+# this script has exited.
+function Remove-ModFiles([string]$game) {
+    if ([IO.Path]::GetFullPath($ModDir).TrimEnd('\') -ieq [IO.Path]::GetFullPath($game).TrimEnd('\') -or
+        (Test-GameDir $ModDir)) {
+        Warn 'The mod''s files are directly in the game folder, not in their own B2S_VR_MOD folder.'
+        Say 'To keep your game safe, none of them were deleted. Delete them yourself if you like:'
+        Say "the files listed in tools\release_files.txt, in $ModDir"
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $Manifest)) {
+        Warn "tools\release_files.txt is missing, so this folder was not deleted: $ModDir"
+        return $false
+    }
+    $dirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rel in (@([IO.File]::ReadAllLines($Manifest)) + 'game_dir.txt')) {
+        $rel = "$rel".Trim()
+        if (-not $rel -or $rel -eq $RunningCmd -or [IO.Path]::IsPathRooted($rel) -or $rel -match '(^|[\\/])\.\.([\\/]|$)') { continue }
+        $p = Join-Path $ModDir $rel
+        if (-not (Test-InsideModDir $p)) { continue }
+        for ($d = Split-Path -Parent $p; $d -and (Test-InsideModDir $d); $d = Split-Path -Parent $d) { [void]$dirs.Add($d) }
+        if (Test-Path -LiteralPath $p -PathType Leaf) { Remove-Item -LiteralPath $p -Force }
+    }
+    foreach ($d in ($dirs | Sort-Object Length -Descending)) {   # deepest first, and only when empty
+        if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $d -Force
+        }
+    }
+    Say 'Deleted the mod''s files from this folder'
+    $left = @(Get-ChildItem -LiteralPath $ModDir -Force | Where-Object { $_.Name -notin (@($RunningCmd) + $StateFiles) })
+    if ($left.Count) {
+        Say 'This folder is kept: it also holds files that are not part of the mod:'
+        foreach ($i in ($left | Select-Object -First 5)) { Say "  $($i.Name)" }
+        if ($left.Count -gt 5) { Say "  ... and $($left.Count - 5) more" }
+    }
+    return $true
+}
+
+# After this script and cmd.exe have exited: the uninstaller .cmd and the setup logs, then this
+# folder if it is empty.
+function Start-FinalCleanup {
+    $quote = { param($s) "'" + ($s -replace "'", "''") + "'" }
+    $paths = (@($RunningCmd) + $StateFiles | ForEach-Object { & $quote (Join-Path $ModDir $_) }) -join ','
+    $dir = & $quote $ModDir
+    $code = "for (`$i = 0; `$i -lt 20; `$i++) { Start-Sleep -Milliseconds 500; " +
+              "foreach (`$f in @($paths)) { Remove-Item -LiteralPath `$f -Force -ErrorAction SilentlyContinue }; " +
+              "if (-not (Test-Path -LiteralPath $(& $quote (Join-Path $ModDir $RunningCmd)))) { break } }; " +
+              "if (-not (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) " +
+              "{ Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue }"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+    Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-EncodedCommand', $enc `
+        -WorkingDirectory (Split-Path -Parent $ModDir) -WindowStyle Hidden
+}
+
 # ---- status (all modes) ---------------------------------------------------------------------------
 function Show-Status([string]$game) {
     $b = Test-KnownBuild $game
@@ -478,9 +546,9 @@ if ($Mode -eq 'Uninstall') {
     Say 'This will:'
     Say '  1. remove the mod (dinput8.dll) from the game folder'
     Say '  2. optionally delete b2svr.ini (your VR settings) and the b2svr_logs folder'
-    Say '  3. delete this whole folder:'
+    Say '  3. delete the mod''s own files from this folder, and the folder once it is empty:'
     Say "     $ModDir"
-    Say 'Your saves and every game file are left alone.'
+    Say 'Your saves, every game file and anything else you keep in this folder are left alone.'
     Write-Host ''
     $a = Ask 'Type YES and press Enter to uninstall (anything else cancels)' 'YES'
     if ($a -ne 'YES' -and $a -ne 'yes') { Say 'Cancelled. Nothing was changed.'; Done 0 }
@@ -515,11 +583,9 @@ if ($Mode -eq 'Uninstall') {
     Write-Host ''
     Say 'Done. Beyond: Two Souls will start normally on your monitor again.'
     if ($NoLaunch) { Say '(-NoLaunch: this folder is kept)'; exit 0 }
-    Say 'This folder is deleted when you close this window.'
+    $cleanup = Remove-ModFiles $game
+    if ($cleanup) { Say 'The last files go when you close this window.' }
     [void](Ask 'Press Enter to finish' '')
-    # The running scripts live in this folder: a detached shell deletes it once they have exited.
-    $parent = Split-Path -Parent $ModDir
-    Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ping -n 4 127.0.0.1 >nul & rd /s /q "' + $ModDir + '"') `
-        -WorkingDirectory $parent -WindowStyle Hidden
+    if ($cleanup) { Start-FinalCleanup }
     exit 0
 }
