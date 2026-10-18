@@ -84,7 +84,8 @@ struct Packet {
     std::atomic<bool> valid{false};
     XrTime displayTime = 0;
     bool shouldRender = false;
-    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};  // fov = the frustum the game renders (symfov)
+    XrFovf ownFov[2] = {};  // the runtime's own frustum per eye: submitted, eye image cropped to it
     XrPosef refPose{{0, 0, 0, 1}, {0, 0, 0}};  // seated reference these views were composed with
     uint32_t recenterEpoch = 0;
     FrameInput input;
@@ -109,8 +110,17 @@ XrTime g_lastWaitTime = 0;
 bool g_lastWaitShouldRender = false;
 // Last completed stereo pair: poses/fov and the scene band of the eye images, for the frozen
 // backdrop behind 2D-only screens.
-XrView g_lastViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+XrView g_lastViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};  // fov = as submitted (the runtime's own)
+xrgeom::UvRect g_lastCrop[2] = {{0.f, 0.f, 1.f, 1.f}, {0.f, 0.f, 1.f, 1.f}};
 bool g_haveLastViews = false;
+
+// 0.17.16 (xr_geometry.h): the part of an eye image rendered with `rendered` that the runtime's own
+// frustum `own` covers.
+xrgeom::UvRect EyeCrop(const XrFovf& rendered, const XrFovf& own) {
+    return xrgeom::CropToFov(
+        xrgeom::TansFromAngles(rendered.angleLeft, rendered.angleRight, rendered.angleUp, rendered.angleDown),
+        xrgeom::TansFromAngles(own.angleLeft, own.angleRight, own.angleUp, own.angleDown));
+}
 uint32_t g_lastEyeTop = 0, g_lastEyeHeight = 0;
 
 // ---- D3D blit (render thread) ---------------------------------------------------------------
@@ -563,16 +573,19 @@ ID3D11RenderTargetView* BackbufferRtv(ID3D11Texture2D* bb) {
     return g_bbRtv;
 }
 
-// Draws src rows [top, top+height) over the whole of rtv (w x h). alphaMode: 0 opaque,
-// 1 keep alpha, 2 UI-over-black coverage alpha. premulBlend composites instead of replacing.
+// Draws src rows [top, top+height) over the whole of rtv (w x h); `crop` (optional) is a part of
+// that band. alphaMode: 0 opaque, 1 keep alpha, 2 UI-over-black coverage alpha. premulBlend
+// composites instead of replacing.
 void Blit(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, uint32_t top, uint32_t height, ID3D11RenderTargetView* rtv,
           int w, int h, int alphaMode = 0, bool premulBlend = false, bool linearize = false, float dim = 0.f,
-          float border = 0.f) {
+          float border = 0.f, const xrgeom::UvRect* crop = nullptr) {
     ID3D11DeviceContext1* ctx1 = nullptr;
     if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1)))) return;
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
-    const float rect[8] = {0.f, float(top) / float(d.Height), 1.f, float(height) / float(d.Height),
+    const xrgeom::UvRect c = crop ? *crop : xrgeom::UvRect{0.f, 0.f, 1.f, 1.f};
+    const float bandTop = float(top) / float(d.Height), bandHeight = float(height) / float(d.Height);
+    const float rect[8] = {c.u0, bandTop + c.v0 * bandHeight, c.u1 - c.u0, (c.v1 - c.v0) * bandHeight,
                            linearize ? 1.f : 0.f, float(alphaMode), dim, border};
     ID3DDeviceContextState* previous = nullptr;
     ctx1->SwapDeviceContextState(g_blitState, &previous);
@@ -988,11 +1001,16 @@ void ReportViewGeometry(XrTime t) {
             h[i] = std::tan(std::max(-e[i].angleLeft, e[i].angleRight));
             v[i] = std::tan(std::max(e[i].angleUp, -e[i].angleDown));
         }
-        Log("XR GEOMETRY submitted: symmetric fov, tan left eye +-%.3f x +-%.3f, right eye +-%.3f x +-%.3f; "
-            "eye images %dx%d", h[0], v[0], h[1], v[1], g_eyes[0].width, g_eyes[0].height);
-    } else {
-        Log("XR GEOMETRY submitted: the runtime's own fov; eye images %dx%d", g_eyes[0].width, g_eyes[0].height);
+        Log("XR GEOMETRY rendered: symmetric fov, tan left eye +-%.3f x +-%.3f, right eye +-%.3f x +-%.3f", h[0],
+            v[0], h[1], v[1]);
+        for (int i = 0; i < 2; ++i) {
+            const xrgeom::UvRect c = xrgeom::CropToFov({-h[i], h[i], v[i], -v[i]},
+                xrgeom::TansFromAngles(e[i].angleLeft, e[i].angleRight, e[i].angleUp, e[i].angleDown));
+            Log("XR GEOMETRY %s eye image cropped to its own fov: u %.3f..%.3f v %.3f..%.3f", i ? "right" : "left",
+                c.u0, c.u1, c.v0, c.v1);
+        }
     }
+    Log("XR GEOMETRY submitted: the runtime's own fov; eye images %dx%d", g_eyes[0].width, g_eyes[0].height);
     if (!r.flags) Log("XR CHECK geometry OK");
     for (unsigned b = 0; b < xrgeom::kFlagCount; ++b)
         if (r.flags & (1u << b)) Log("XR CHECK WARNING: %s", xrgeom::FlagText(1u << b));
@@ -1060,8 +1078,10 @@ int BeginGameFrame(EyeView eyes[2], FrameInput* input) {
             std::atan2(l.m[8], l.m[10]) * 57.29578f, std::atan2(r.m[8], r.m[10]) * 57.29578f,
             (l.m[12]+r.m[12])*.5f, (l.m[13]+r.m[13])*.5f, (l.m[14]+r.m[14])*.5f);
     }
+    for (int e = 0; e < 2; ++e) p.ownFov[e] = p.views[e].fov;
     if (g_symFov) {
-        // EXP-014 discriminator: render and submit a symmetric frustum that contains the eye's own.
+        // EXP-014: render a symmetric frustum that contains the eye's own. 0.17.16: the eye image is
+        // cropped back to the eye's own frustum and that is what is submitted (xr_geometry.h).
         for (auto& v : p.views) {
             const float h = std::max(-v.fov.angleLeft, v.fov.angleRight);
             const float vv = std::max(v.fov.angleUp, -v.fov.angleDown);
@@ -1214,7 +1234,9 @@ void OnEye(int eye, int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, ui
             XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             wi.timeout = XR_INFINITE_DURATION;
             xrWaitSwapchainImage(s.handle, &wi);
-            Blit(ctx, src, srcTop, srcHeight, s.rtvs[idx], s.width, s.height, 0, false, g_linearizeInShader);
+            const xrgeom::UvRect crop = EyeCrop(p.views[eye].fov, p.ownFov[eye]);
+            Blit(ctx, src, srcTop, srcHeight, s.rtvs[idx], s.width, s.height, 0, false, g_linearizeInShader, 0.f, 0.f,
+                 &crop);
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             xrReleaseSwapchainImage(s.handle, &ri);
         }
@@ -1232,7 +1254,7 @@ void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool scen
                                                   {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         for (int e = 0; e < 2; ++e) {
             pv[e].pose = p.views[e].pose;
-            pv[e].fov = p.views[e].fov;
+            pv[e].fov = p.ownFov[e];  // the eye image was cropped to it (OnEye)
             pv[e].subImage.swapchain = g_eyes[e].handle;
             pv[e].subImage.imageRect = {{0, 0}, {g_eyes[e].width, g_eyes[e].height}};
         }
@@ -1251,8 +1273,11 @@ void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool scen
         ei.layers = panelOnly ? layers + 1 : layers;
         const XrResult r = xrEndFrame(g_session, &ei);
         if (p.shouldRender) {
-            g_lastViews[0] = p.views[0];
-            g_lastViews[1] = p.views[1];
+            for (int e = 0; e < 2; ++e) {
+                g_lastCrop[e] = EyeCrop(p.views[e].fov, p.ownFov[e]);
+                g_lastViews[e] = p.views[e];
+                g_lastViews[e].fov = p.ownFov[e];
+            }
             g_haveLastViews = true;
         }
         g_frameOpen = false;
@@ -1591,7 +1616,7 @@ bool FlatFrame(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID3D11Text
             wi.timeout = XR_INFINITE_DURATION;
             xrWaitSwapchainImage(s.handle, &wi);
             Blit(ctx, lastEyes[e], g_lastEyeTop, g_lastEyeHeight, s.rtvs[idx], s.width, s.height, 0, false,
-                 g_linearizeInShader);
+                 g_linearizeInShader, 0.f, 0.f, &g_lastCrop[e]);
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             xrReleaseSwapchainImage(s.handle, &ri);
             pv[e].pose = g_lastViews[e].pose;

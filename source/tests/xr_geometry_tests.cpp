@@ -2,6 +2,7 @@
 // Run: build\RelWithDebInfo\xr_geometry_tests.exe (or ctest).
 #include <cmath>
 #include <cstdio>
+#include <initializer_list>
 
 #include "../src/xr_geometry.h"
 
@@ -101,6 +102,34 @@ int main() {
               "game views: right eye at +64 mm in the left view");
         const pose::Vec3 s = RightEyeInLeftView(pose::RigidInverse(camR), pose::RigidInverse(camL));
         Check(s.x < 0.f, "game views swapped: right eye at negative x");
+    }
+    {
+        // 0.17.16 crop: the eye image rendered symmetric, cut to the eye's own (asymmetric) frustum.
+        const Tans sym{-1.376f, 1.376f, 1.428f, -1.428f};
+        const Tans own{-1.376f, 0.933f, 1.192f, -1.428f};  // a Quest 3 left eye: wider outwards and down
+        const UvRect c = CropToFov(sym, own);
+        Check(Near(c.u0, 0.f) && Near(c.u1, (0.933f + 1.376f) / 2.752f), "crop: left edge kept, right edge cut");
+        Check(Near(c.v0, (1.428f - 1.192f) / 2.856f) && Near(c.v1, 1.f), "crop: top cut, bottom kept (v down)");
+        // Every direction lands at the same place in the cropped image as in an image rendered with `own`.
+        bool same = true;
+        for (float t : {-1.2f, -0.4f, 0.f, 0.5f, 0.9f}) {
+            const float u = (t - sym.left) / (sym.right - sym.left);
+            const float inCrop = (u - c.u0) / (c.u1 - c.u0);
+            same = same && Near(inCrop, (t - own.left) / (own.right - own.left), 1e-4f);
+        }
+        for (float t : {1.1f, 0.3f, -0.2f, -1.4f}) {
+            const float v = (sym.up - t) / (sym.up - sym.down);
+            const float inCrop = (v - c.v0) / (c.v1 - c.v0);
+            same = same && Near(inCrop, (own.up - t) / (own.up - own.down), 1e-4f);
+        }
+        Check(same, "crop: directions map as if rendered with the eye's own frustum");
+        const UvRect full = CropToFov(sym, sym);
+        Check(Near(full.u0, 0.f) && Near(full.v0, 0.f) && Near(full.u1, 1.f) && Near(full.v1, 1.f),
+              "crop: same frustum -> whole image");
+        const UvRect wide = CropToFov(own, sym);  // own wider than rendered: clamped to the image
+        Check(wide.u0 >= 0.f && wide.u1 <= 1.f && wide.v0 >= 0.f && wide.v1 <= 1.f, "crop: clamped to the image");
+        const Tans fromAngles =TansFromAngles(-0.9425f, 0.7505f, 0.8727f, -0.9599f);
+        Check(Near(fromAngles.left, std::tan(-0.9425f)) && Near(fromAngles.down, std::tan(-0.9599f)), "crop: tangents from angles");
     }
     std::printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

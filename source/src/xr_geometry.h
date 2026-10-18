@@ -94,6 +94,33 @@ inline Report Evaluate(const Eye& left, const Eye& right) {
     return r;
 }
 
+// ---- 0.17.16: crop the symmetric eye image to the eye's own frustum ---------------------------
+// The game renders each eye with a symmetric frustum containing the eye's own (EXP-014: some engine
+// passes ignore off-centre projections). Submitting that wider symmetric frustum is valid OpenXR and
+// fine on SteamVR, but over Quest Link (Meta's runtime) near objects came out doubled; another mod
+// submitting an enlarged symmetric frustum showed the same on Quest 2. Now only the part of the image
+// the eye's own frustum covers is copied, and the runtime gets back exactly the frustum it reported.
+
+struct Tans {
+    float left, right, up, down;  // tangents: left and down negative
+};
+inline Tans TansFromAngles(float angleLeft, float angleRight, float angleUp, float angleDown) {
+    return {std::tan(angleLeft), std::tan(angleRight), std::tan(angleUp), std::tan(angleDown)};
+}
+
+struct UvRect {
+    float u0, v0, u1, v1;  // in the rendered image, v down
+};
+
+// The part of an image rendered with frustum `rendered` that frustum `own` covers, clamped to the image.
+inline UvRect CropToFov(const Tans& rendered, const Tans& own) {
+    const auto clamp01 = [](float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
+    const float w = rendered.right - rendered.left, h = rendered.up - rendered.down;
+    if (!(w > 0.f) || !(h > 0.f)) return {0.f, 0.f, 1.f, 1.f};
+    return {clamp01((own.left - rendered.left) / w), clamp01((rendered.up - own.up) / h),
+            clamp01((own.right - rendered.left) / w), clamp01((rendered.up - own.down) / h)};
+}
+
 // Right-eye camera position in the left eye's view space (metres), from the two world-to-view
 // matrices the game renders with. Parallel eyes give about (+IPD, 0, 0).
 inline pose::Vec3 RightEyeInLeftView(const pose::Mat4& viewLeft, const pose::Mat4& viewRight) {
