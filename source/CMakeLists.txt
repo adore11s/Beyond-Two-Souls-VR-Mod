@@ -94,6 +94,11 @@ add_executable(xr_input_tests tests/xr_input_tests.cpp)
 target_compile_options(xr_input_tests PRIVATE /W4 /permissive-)
 add_test(NAME xr_input_tests COMMAND xr_input_tests)
 
+# Headset view geometry checks written to the session log (src/xr_geometry.h).
+add_executable(xr_geometry_tests tests/xr_geometry_tests.cpp)
+target_compile_options(xr_geometry_tests PRIVATE /W4 /permissive-)
+add_test(NAME xr_geometry_tests COMMAND xr_geometry_tests)
+
 add_executable(fp_math_tests tests/fp_math_tests.cpp)
 target_compile_options(fp_math_tests PRIVATE /W4 /permissive-)
 add_test(NAME fp_math_tests COMMAND fp_math_tests)

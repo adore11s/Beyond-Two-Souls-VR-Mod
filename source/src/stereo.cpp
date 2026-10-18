@@ -28,6 +28,7 @@
 #include "posemath.h"
 #include "rendersize.h"
 #include "xr.h"
+#include "xr_geometry.h"
 
 namespace b2s::stereo {
 
@@ -1776,6 +1777,46 @@ void InstallCullView() {
          reinterpret_cast<void**>(&g_origVpJitter), "VIEWPORT::Jitter");
 }
 
+// Session log (xr_geometry.h): what the game's main stereo camera renders with per eye, every
+// 30 s: the right eye's position in the left eye's view and each eye's projection against the
+// headset tangents it was built from.
+struct EyeCamSample {
+    bool have = false;
+    pose::Mat4 view;
+    float proj[4];  // p[0], p[5], p[8], p[9]
+};
+EyeCamSample g_eyeCam[2];
+ULONGLONG g_nextEyeCamReport = 0;
+
+void ReportEyeCameras(int eye, void* cam) {
+    if (cam != g_stereoCams[0] || GetTickCount64() < g_nextEyeCamReport) return;
+    const auto* c = static_cast<const uint8_t*>(cam);
+    EyeCamSample& s = g_eyeCam[eye];
+    std::memcpy(s.view.m, c + off::CamView, sizeof(s.view.m));
+    const auto* p = reinterpret_cast<const float*>(c + off::CamProj);
+    s.proj[0] = p[0];
+    s.proj[1] = p[5];
+    s.proj[2] = p[8];
+    s.proj[3] = p[9];
+    s.have = eye == 1 ? g_eyeCam[0].have : true;  // a pair: eye 0 then eye 1 of the same frame
+    if (eye != 1 || !s.have) return;
+    g_eyeCam[0].have = g_eyeCam[1].have = false;
+    g_nextEyeCamReport = GetTickCount64() + 30000;
+    const pose::Vec3 d = xrgeom::RightEyeInLeftView(g_eyeCam[0].view, g_eyeCam[1].view);
+    Log("STEREO CHECK game cameras: right eye at (%+.1f %+.1f %+.1f) mm in the left eye's view "
+        "(about +IPD 0 0 expected)", d.x * 1000.f, d.y * 1000.f, d.z * 1000.f);
+    for (int e = 0; e < 2; ++e) {
+        const xr::EyeView& ev = g_xrEyes[e];
+        const float l = ev.tanLeft, rt = ev.tanRight, u = ev.tanUp, dn = ev.tanDown;
+        Log("STEREO CHECK eye %d projection p0=%.4f p5=%.4f p8=%+.4f p9=%+.4f (headset %.4f %.4f %+.4f %+.4f)", e,
+            g_eyeCam[e].proj[0], g_eyeCam[e].proj[1], g_eyeCam[e].proj[2], g_eyeCam[e].proj[3], 2.f / (rt - l),
+            2.f / (u - dn), (rt + l) / (rt - l), (u + dn) / (u - dn));
+    }
+    if (!(d.x > 0.f)) Log("STEREO CHECK WARNING: the right-eye camera is not to the right of the left-eye camera");
+    if (std::fabs(d.y) > 0.002f || std::fabs(d.z) > 0.002f)
+        Log("STEREO CHECK WARNING: the eye cameras differ in height or depth");
+}
+
 void AfterCameraBuild(void* cam) {
     const int eye = g_recordingEye;
     if (eye < 0 || eye > 1 || !g_haveXrEyes || !IsStereoCam(cam)) return;
@@ -1812,6 +1853,7 @@ void AfterCameraBuild(void* cam) {
         p[8] = (rt + l) / (rt - l);
         p[9] = (u + d) / (u - d);
     }
+    ReportEyeCameras(eye, cam);
 }
 
 void BeforePresent() {

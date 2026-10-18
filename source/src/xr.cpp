@@ -21,6 +21,7 @@
 #include "log.h"
 #include "posemath.h"
 #include "videowatch.h"
+#include "xr_geometry.h"
 #include "xr_recenter.h"
 
 namespace b2s::xr {
@@ -98,6 +99,7 @@ XrView g_goodViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 std::atomic<bool> g_symFov{true};
 std::atomic<float> g_headOffY{0.f}, g_headOffPitch{0.f};  // EXP-018 test offsets (m, deg)
 bool g_haveGoodViews = false;
+ULONGLONG g_nextGeometryReport = 0;  // game thread; 0 = report on the next tracked frame
 std::atomic<int> g_nextSlot{0};
 std::atomic<bool> g_beginPending{false};  // waited on the game thread, not yet begun
 std::atomic<bool> g_frameOpen{false};     // render thread: xrBeginFrame without xrEndFrame
@@ -883,6 +885,7 @@ void Shutdown(const char* why) {
     g_lost = false;
     g_haveLastViews = false;
     g_haveGoodViews = false;
+    g_nextGeometryReport = 0;
     g_recenterRequest = true;
     g_settle.Reset();
     if (had) Log("XR shut down (%s); the game renders flat until the next start", why);
@@ -949,6 +952,52 @@ void SetHeadTestOffset(float dy, float pitchDeg) {
     g_headOffPitch = pitchDeg;
 }
 
+// Session log (xr_geometry.h): each eye relative to the head as the runtime reports it, what is
+// submitted, and any oddity flagged as a CHECK WARNING. On the first tracked frame of a session,
+// then every 30 s.
+void ReportViewGeometry(XrTime t) {
+    XrView hv[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    XrViewState vs{XR_TYPE_VIEW_STATE};
+    XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    li.displayTime = t;
+    li.space = g_viewSpace;
+    uint32_t n = 0;
+    if (!XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &n, hv)) || n != 2) {
+        Log("XR GEOMETRY: views relative to the head unavailable");
+        return;
+    }
+    xrgeom::Eye e[2];
+    for (int i = 0; i < 2; ++i)
+        e[i] = {Q(hv[i].pose.orientation), V(hv[i].pose.position), hv[i].fov.angleLeft, hv[i].fov.angleRight,
+                hv[i].fov.angleUp, hv[i].fov.angleDown};
+    const xrgeom::Report r = xrgeom::Evaluate(e[0], e[1]);
+    constexpr float kToDeg = 57.2957795f;
+    Log("XR GEOMETRY %s, %s (view state 0x%llx)", g_runtimeName, g_systemName, (unsigned long long)vs.viewStateFlags);
+    for (int i = 0; i < 2; ++i)
+        Log("XR GEOMETRY %s eye: pos=(%+.1f %+.1f %+.1f) mm yaw=%+.2f pitch=%+.2f roll=%+.2f deg "
+            "fov left=%.2f right=%.2f up=%.2f down=%.2f deg",
+            i ? "right" : "left", e[i].p.x * 1000.f, e[i].p.y * 1000.f, e[i].p.z * 1000.f, r.eye[i].yaw,
+            r.eye[i].pitch, r.eye[i].roll, e[i].angleLeft * kToDeg, e[i].angleRight * kToDeg,
+            e[i].angleUp * kToDeg, e[i].angleDown * kToDeg);
+    Log("XR GEOMETRY eyes: ipd=%.1f mm, right-left height %+.2f mm, depth %+.2f mm, angle between eyes %.2f deg",
+        r.ipdMm, r.dyMm, r.dzMm, r.cantDeg);
+    if (g_symFov) {
+        float h[2], v[2];
+        for (int i = 0; i < 2; ++i) {
+            h[i] = std::tan(std::max(-e[i].angleLeft, e[i].angleRight));
+            v[i] = std::tan(std::max(e[i].angleUp, -e[i].angleDown));
+        }
+        Log("XR GEOMETRY submitted: symmetric fov, tan left eye +-%.3f x +-%.3f, right eye +-%.3f x +-%.3f; "
+            "eye images %dx%d", h[0], v[0], h[1], v[1], g_eyes[0].width, g_eyes[0].height);
+    } else {
+        Log("XR GEOMETRY submitted: the runtime's own fov; eye images %dx%d", g_eyes[0].width, g_eyes[0].height);
+    }
+    if (!r.flags) Log("XR CHECK geometry OK");
+    for (unsigned b = 0; b < xrgeom::kFlagCount; ++b)
+        if (r.flags & (1u << b)) Log("XR CHECK WARNING: %s", xrgeom::FlagText(1u << b));
+}
+
 int BeginGameFrame(EyeView eyes[2], FrameInput* input) {
     if (input) *input = FrameInput{};  // also neutral on every early exit
     if (!g_started) return -1;
@@ -987,6 +1036,10 @@ int BeginGameFrame(EyeView eyes[2], FrameInput* input) {
             std::isfinite(pos.y) && std::isfinite(pos.z);
     }
     ValidateViews(p.views, vs.viewStateFlags);
+    if (trackedViews && GetTickCount64() >= g_nextGeometryReport) {
+        g_nextGeometryReport = GetTickCount64() + 30000;
+        ReportViewGeometry(fs.predictedDisplayTime);
+    }
 
     // One reference per packet: the eye transforms and the UI panel of this frame use the same
     // recenter generation.
