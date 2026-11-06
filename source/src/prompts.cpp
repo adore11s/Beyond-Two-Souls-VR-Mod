@@ -37,6 +37,7 @@ UpdateFn g_original = nullptr;
 std::atomic<bool> g_enabled{true};
 std::atomic<uint64_t> g_moved{0}, g_calls{0}, g_inF1{0};
 std::atomic<uint64_t> g_lastUpdateMs{0};  // last iconic record update (Showing)
+std::atomic<uint64_t> g_lastStickPromptMs{0};  // last frame a shown prompt asked for the right stick (Showing)
 uint64_t g_lastSummaryTick = 0, g_lastSummaryCalls = 0;
 
 // Diagnostic: the first frames of every element seen in F1 (offset from her head, pinned or not).
@@ -342,8 +343,54 @@ bool FirstSight(uint8_t* menu) {
     return true;
 }
 
+// 0.23.0 (owner: "when near a prompt I can turn, like swiping prompts, in first person"): F1 view turning stopped only
+// for the white dots (HookUpdateRecord). STATIC: FUN_1411d3360 (per frame, it advances RenderState+0xBF4) calls
+// FUN_140e46850 for every MPAR_GUI entry whose menu is on screen (DAT_141ca8770 +0x80 list); each element lists the
+// inputs it asks for (PAR_ELEMENT_ABC::vfunc_122 0x140fa4000, inherited by every MPAR element but the white dot:
+// element+0x70 KCOM handle -> object +0x44 count, +0x48 entries of 0x0c bytes, +0 input id; 0x68 - 0x6b = "Right Stick
+// Left / Right / Up / Down"). A shown prompt with a right-stick input = the stick is the game's: no view turn.
+bool CachedKcom(const uint8_t* handle, const uint8_t** out) {
+    if (!handle || reinterpret_cast<uintptr_t>(handle) < 0x10000) return false;
+    if (!((*reinterpret_cast<const uint32_t*>(handle + 0x20) >> 29) & 1)) return false;
+    *out = *reinterpret_cast<const uint8_t* const*>(handle + 0x30);
+    return *out != nullptr;
+}
+bool WantsRightStick(void* entry, uintptr_t* elementVt) {
+    __try {
+        const uint8_t* element = *reinterpret_cast<uint8_t* const*>(static_cast<uint8_t*>(entry) + kEntryElement);
+        if (!element) return false;
+        *elementVt = *reinterpret_cast<const uintptr_t*>(element);
+        const uint8_t* inputs = nullptr;
+        if (!CachedKcom(*reinterpret_cast<const uint8_t* const*>(element + 0x70), &inputs)) return false;
+        const uint32_t count = *reinterpret_cast<const uint32_t*>(inputs + 0x44);
+        const uint8_t* list = *reinterpret_cast<const uint8_t* const*>(inputs + 0x48);
+        if (!list || count > 64) return false;
+        for (uint32_t i = 0; i < count; ++i) {
+            const int32_t id = *reinterpret_cast<const int32_t*>(list + i * 0x0c);
+            if (id >= 0x68 && id <= 0x6b) return true;
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void NoteStickPrompt(void* entry) {
+    uintptr_t vt = 0;
+    if (!entry || !WantsRightStick(entry, &vt)) return;
+    g_lastStickPromptMs.store(GetTickCount64(), std::memory_order_relaxed);
+    static uintptr_t logged[16]{};
+    for (uintptr_t& l : logged) {
+        if (l == vt) return;
+        if (!l) {
+            l = vt;
+            Log("PROMPTS stick prompt on screen (class vt 0x%llx) asks for the right stick: no F1 view turn while it shows",
+                static_cast<unsigned long long>(vt ? vt - game::ModuleBase() + 0x140000000ull : 0));
+            return;
+        }
+    }
+}
+
 void HookPlaceElement(void* gui, void* entry) {
     g_placeOriginal(gui, entry);
+    NoteStickPrompt(entry);
     uint8_t* menu = nullptr;
     float m[16];
     uintptr_t vt = 0;
@@ -410,8 +457,9 @@ void SetEnabled(bool on) {
 bool Enabled() { return g_enabled.load(); }
 uint64_t LastShownMs() { return g_lastUpdateMs.load(std::memory_order_relaxed); }
 bool Showing(uint64_t nowMs) {
-    const uint64_t last = g_lastUpdateMs.load(std::memory_order_relaxed);
-    return last && nowMs >= last && nowMs - last < 250;
+    for (const uint64_t last : {g_lastUpdateMs.load(std::memory_order_relaxed), g_lastStickPromptMs.load(std::memory_order_relaxed)})
+        if (last && nowMs >= last && nowMs - last < 250) return true;
+    return false;
 }
 
 bool Install() {

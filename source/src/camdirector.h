@@ -22,7 +22,8 @@ const char* Name(void* behaviour);
 void* Child(void* behaviour);
 
 // A camera filter (CAMERA_MODIFIER_CAMERA_SHADER: a screen shader on the game camera, e.g. the
-// security-camera look) is switched on right now.
+// security-camera look) that belongs to a camera is switched on right now. Filters owned by the camera
+// director itself (level-wide looks such as the submarine's underwater shader, EXP-061) do not count.
 bool FilterActive();
 
 }  // namespace b2s::camdirector

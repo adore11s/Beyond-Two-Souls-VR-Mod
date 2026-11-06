@@ -65,8 +65,11 @@ void LogFilter(const char* what, void* modifier) {
     char ownerName[96];
     game::ObjectName(owner, ownerName, sizeof(ownerName));
     void* active = Active();
-    Log("CAMDIR camera filter %s: %s (%p) on %s %s; active camera %s / %s", what, name[0] ? name : "?", modifier,
-        Name(owner), ownerName[0] ? ownerName : "?", Name(active), Name(Child(active)));
+    const bool level = owner && owner == g_director.load();
+    Log("CAMDIR camera filter %s: %s (%p) on %s %s (%s); active camera %s / %s", what, name[0] ? name : "?", modifier,
+        Name(owner), ownerName[0] ? ownerName : "?",
+        level ? "the camera director's own: a level-wide look, first person keeps going" : "a camera's own: first person pauses",
+        Name(active), Name(Child(active)));
 }
 void HookActivate(void* self, void* a, void* b, void* c) {
     g_origActivate(self, a, b, c);
@@ -147,6 +150,11 @@ void HookOpacityFadeUpdate(void* self, float dt) {
     g_origOpacityFadeUpdate(self, dt);
 }
 
+void* ModifierOwner(void* m) {
+    __try { return *reinterpret_cast<void**>(static_cast<uint8_t*>(m) + kModifierOwner); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
 bool IsLiveModifier(void* m) {
     __try { return m && *static_cast<uintptr_t*>(m) == game::Va(kShaderModifierVt); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -202,12 +210,22 @@ bool Install() {
     return true;
 }
 
+// EXP-061 (owner 0.25.0, 2403 Dragon's Hideout Submarine: "first person doesn't work"). LIVE: the level keeps
+// CAMERA_MODIFIER_CAMERA_SHADER_Entity4824_RT on for the whole level (re-applied every ~11 s), so the 0.16.13 pause held
+// first person off throughout. Its owner (+0x98) is the CAMERA_DIRECTOR itself (vtable 0x1417502c8, peek 1188 s): a
+// level-wide look (the scripts set the underwater CAMSHADER_SUBWATER through ViewportSetCameraShader). The DPA
+// security-camera feed belongs to the camera that shows it (INFERENCE: no DPA log left). Only a camera's own filter
+// pauses first person now.
 bool FilterActive() {
     std::lock_guard lock(g_filterMutex);
+    void* const director = g_director.load();
     bool any = false;
     for (void*& f : g_filters) {
         if (f && !IsLiveModifier(f)) f = nullptr;  // freed without being switched off
-        any |= f != nullptr;
+        if (!f) continue;
+        void* const owner = ModifierOwner(f);
+        if (owner && owner == director) continue;  // the director's own: a level-wide look
+        any = true;
     }
     return any;
 }

@@ -5,6 +5,7 @@
 #include <dxgi.h>
 
 #include <MinHook.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstdio>
@@ -27,12 +28,17 @@
 #include "log.h"
 #include "posemath.h"
 #include "rendersize.h"
+#include "devtools.h"
+#include "storyvars.h"
+#include "texguard.h"
+#include "audio.h"
 #include "xr.h"
 #include "xr_geometry.h"
 
 namespace b2s::stereo {
 
 void InstallCullView();  // shared cull view (EXP-013), defined below
+void InstallViewportSnapshot();  // EXP-049, defined below
 namespace {
 
 using namespace b2s::game;
@@ -86,6 +92,38 @@ std::atomic<bool> g_capture{true};  // "capture off": record per eye but emit no
 std::atomic<bool> g_suppressParticles{false};
 std::atomic<float> g_ipd{0.064f};
 std::atomic<int> g_recordingEye{-1};  // game thread: eye being recorded, -1 when mono
+// The pass being recorded (0 = the frame's first) and whether it is the frame's last: with AFR the only pass
+// can be the right eye, so "eye 1" no longer means "the second pass".
+std::atomic<int> g_recordingPass{-1};
+std::atomic<bool> g_recordingLast{false};
+// Rendering method (VR settings, stereo.h Method, b2svr.ini rendering_method): Native draws both eyes every frame (the
+// default again since 1.0.0, owner 2026-11-06: "make the mods default rendering native stereo"; AFR was the default
+// 0.18.1-0.26.0); AFR draws one eye per frame, alternating; Mono draws one centre picture for both eyes (playbook 18.7,
+// EXP-048).
+std::atomic<int> g_method{kNative};
+int g_afrNext = 0;  // game thread: the eye the next AFR frame draws
+// Frames with XR eyes since the last stats line: AFR left / right eye only, both eyes (native, or AFR's fallback),
+// Mono (one centre picture).
+std::atomic<uint64_t> g_afrFrames[2] = {}, g_bothFrames{0}, g_monoFrames{0};
+std::atomic<uint64_t> g_stampsUnkeyed{0};  // EXP-048: probe-lighting stamps whose eye key was removed
+std::atomic<uint64_t> g_vpRecords{0}, g_vpStale{0};  // EXP-049: viewport records in eye passes / with another view
+
+// GPU time of a frame's 3D eye passes (0.18.1: AFR must show its saving in the log, not only "on"): D3D11
+// timestamps from the marker B2SVR:GPU0 (recorded before the first pass) to the copy of the frame's last eye,
+// read back frames later without waiting. It includes any time the GPU waited for the render thread mid-frame.
+// Render thread only (OnMarker / CopyEye / BeforePresent, all under g_bbMutex).
+const char* const kGpuMarker = "B2SVR:GPU0";
+struct GpuTimer {
+    static constexpr int kN = 4;
+    ID3D11Query* disjoint[kN] = {};
+    ID3D11Query* t0[kN] = {};
+    ID3D11Query* t1[kN] = {};
+    bool pending[kN] = {}, discard[kN] = {};
+    int open = -1;  // the slot between Begin and End
+    bool failed = false;
+    double sumMs = 0.0, maxMs = 0.0;
+    uint64_t samples = 0;
+} g_gpu;
 std::atomic<uint64_t> g_eyeCopies[kMaxPasses] = {};
 std::atomic<uint64_t> g_pairsRecorded{0};
 
@@ -131,7 +169,7 @@ void HookDisplay2D(void* list, void* cmdbuf) {
         EmitMarker(cmdbuf, slot >= 0 && eye < 2 ? kXrMarkers.names[eye][slot] : kEyeMarker[eye]);
     }
     // UI is recorded once, with the last pass, so it reaches the flat window unchanged.
-    if (eye == g_passes - 1) {
+    if (g_recordingLast) {
         g_origDisplay2D(list, cmdbuf);
         return;
     }
@@ -193,7 +231,7 @@ void LogCloseupLightCount(void* manager) {
 }
 
 void HookCloseupAttach(void* manager, void* scene) {
-    if (g_recordingEye <= 0) LogCloseupLightCount(manager);
+    if (g_recordingPass <= 0) LogCloseupLightCount(manager);
     if (g_closeupOff) return;
     // The close-up rig is placed relative to the shot camera. In F3 the view is at Jodie's eyes, so
     // the rig sat right beside the characters near her (owner, 2026-10-11: "characters near Jodie
@@ -206,17 +244,17 @@ void HookCloseupAttach(void* manager, void* scene) {
         }
         return;
     }
-    if (g_recordingEye >= 1 && g_fixCloseupLights) return;
+    if (g_recordingPass >= 1 && g_fixCloseupLights) return;
     g_origCloseupAttach(manager, scene);
 }
 
 void HookPreParticles(void* list) {
-    if (g_recordingEye >= 1 && g_suppressParticles) return;
+    if (g_recordingPass >= 1 && g_suppressParticles) return;
     g_origPreParticles(list);
 }
 
 void HookPostParticles(void* list) {
-    if (g_recordingEye >= 1 && g_suppressParticles) return;
+    if (g_recordingPass >= 1 && g_suppressParticles) return;
     g_origPostParticles(list);
 }
 
@@ -260,11 +298,220 @@ std::atomic<uint32_t> g_skipStages{0};
 constexpr int kStageReflection = 11;  // 0x140889860 "DisplayReflection"
 constexpr int kStageMirrors = 13;     // 0x1408895b0 "DisplayMirrors"
 
+// EXP-050 diagnostic (`reflprobe <n>`): the next n DisplayReflection stages log the eye, the frame key and the flag
+// word that gates the planar reflection. STATIC: FUN_140867350 / FUN_140867650 draw / gather it only when bit 9 of
+// *(*(layer + 0x50) + 0x30) + 0x44 is set, layer = the display layer being drawn (0x141c79008, set by
+// FUN_140851430 around VIEWPORT_LIST::Display).
+std::atomic<int> g_reflProbe{0};
+void ReflProbe() {
+    const auto* layerVa = reinterpret_cast<uint8_t* const*>(game::Va(0x141c79008));
+    const auto* rsVa = reinterpret_cast<uint8_t* const*>(game::Va(0x141c78958));
+    uint8_t* layer = nullptr;
+    uint8_t* settings = nullptr;
+    uint32_t flags = 0, frame = 0;
+    __try {
+        layer = layerVa ? *layerVa : nullptr;
+        if (uint8_t* h = layer ? *reinterpret_cast<uint8_t**>(layer + 0x50) : nullptr)
+            settings = *reinterpret_cast<uint8_t**>(h + 0x30);
+        if (settings) flags = *reinterpret_cast<uint32_t*>(settings + 0x44);
+        if (rsVa && *rsVa) frame = *reinterpret_cast<uint32_t*>(*rsVa + 0xBF4);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    Log("REFLPROBE eye=%d pass=%d frame=0x%08x layer=%p settings=%p flags=0x%08x reflection=%d", g_recordingEye.load(),
+        g_recordingPass.load(), frame, layer, settings, flags, int(flags >> 9 & 1));
+}
+
+// EXP-053 diagnostic (`visprobe <passes>`, read-only): the object visibility of the main camera's scene at four points
+// of the next eye passes (start, after the G-buffer cull stage 0x140889a20, after the G-buffer gather stage
+// 0x140889770, end). STATIC (0.21.0 build): SCENE = camera+0x78 -> +0x30; visibility manager = *(*(SCENE+400)+0x60);
+// its +0x60 index picks the result holder at +0x70 + idx*8 -> block: +0x10 rooms, +0x2c visible rooms (0x90-byte
+// entries at block + *(block+0x24), room at +0x70), +0x38 lights. Room manager = vis+0x68: 16 category batches at
+// +0x00..+0x78, each batch +8 = (segment, room) pairs, +0x10 count; a segment is culled (FUN_1409e2cf0) and gathered
+// (FUN_1402caf90) only when its room is 0 or on the visible list. Every FIXED_VISIBILITY_SEGMENT keeps a ring of result
+// slots (depth = its second template number: 1, 2, 8, 10, 34, 38 or 64): the cull (vfunc_03) advances a write slot,
+// the gather (vfunc_04) a read slot; class-independent pointers: +0x48 -> object count, +0x68 -> culled count of the
+// write slot, +0x60 -> count of the read slot. "unpaired" = active segments whose read slot is not their write slot.
+std::atomic<int> g_visProbe{0};
+constexpr int kVisMaxRooms = 512;
+
+bool VisReadPtr(const void* base, size_t off, uint8_t** out) {
+    __try {
+        *out = *reinterpret_cast<uint8_t* const*>(static_cast<const uint8_t*>(base) + off);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool VisReadU32(const void* base, size_t off, uint32_t* out) {
+    __try {
+        *out = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(base) + off);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void VisProbe(const char* at) {
+    void* cam = g_mainCam.load();
+    uint8_t *link = nullptr, *scene = nullptr, *sg = nullptr, *vis = nullptr, *rooms = nullptr, *holder = nullptr,
+            *block = nullptr;
+    uint32_t idx = 0;
+    if (!cam || !VisReadPtr(cam, 0x78, &link) || !link || !VisReadPtr(link, 0x30, &scene) || !scene ||
+        !VisReadPtr(scene, 400, &sg) || !sg || !VisReadPtr(sg, 0x60, &vis) || !vis || !VisReadPtr(vis, 0x68, &rooms) ||
+        !rooms || !VisReadU32(vis, 0x60, &idx) || idx > 1 || !VisReadPtr(vis, 0x70 + idx * 8, &holder) || !holder ||
+        !VisReadPtr(holder, 0, &block) || !block) {
+        Log("VISPROBE pass=%d eye=%d %-6s chain broken cam=%p scene=%p sg=%p vis=%p rooms=%p block=%p",
+            g_recordingPass.load(), g_recordingEye.load(), at, cam, scene, sg, vis, rooms, block);
+        return;
+    }
+    uint32_t nRooms = 0, nVis = 0, nLights = 0, visOff = 0;
+    VisReadU32(block, 0x10, &nRooms);
+    VisReadU32(block, 0x2c, &nVis);
+    VisReadU32(block, 0x38, &nLights);
+    VisReadU32(block, 0x24, &visOff);
+    static uint8_t* visRooms[kVisMaxRooms];
+    const uint32_t nv = nVis < kVisMaxRooms ? nVis : kVisMaxRooms;
+    for (uint32_t i = 0; i < nv; ++i)
+        if (!VisReadPtr(block, size_t(visOff) + i * 0x90 + 0x70, &visRooms[i])) visRooms[i] = nullptr;
+    int segs = 0, active = 0, unpaired = 0;
+    long long objs = 0, culled = 0, gathered = 0;
+    char cats[512];
+    int len = 0;
+    cats[0] = 0;
+    for (int c = 0; c < 16; ++c) {
+        uint8_t *batch = nullptr, *arr = nullptr;
+        uint32_t n = 0;
+        if (!VisReadPtr(rooms, size_t(c) * 8, &batch) || !batch || !VisReadPtr(batch, 8, &arr) || !arr ||
+            !VisReadU32(batch, 0x10, &n))
+            continue;
+        if (n > 8192) n = 8192;
+        int cSegs = 0, cActive = 0, cUnpaired = 0;
+        long long cCulled = 0, cGathered = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            uint8_t *seg = nullptr, *segRoom = nullptr, *pTotal = nullptr, *pW = nullptr, *pR = nullptr;
+            if (!VisReadPtr(arr, size_t(i) * 16, &seg) || !seg || !VisReadPtr(arr, size_t(i) * 16 + 8, &segRoom)) continue;
+            ++cSegs;
+            bool on = segRoom == nullptr;
+            for (uint32_t k = 0; k < nv && !on; ++k) on = visRooms[k] == segRoom;
+            if (!on) continue;
+            ++cActive;
+            uint32_t total = 0, w = 0, r = 0;
+            if (VisReadPtr(seg, 0x48, &pTotal) && pTotal) VisReadU32(pTotal, 0, &total);
+            if (VisReadPtr(seg, 0x68, &pW) && pW) VisReadU32(pW, 0, &w);
+            if (VisReadPtr(seg, 0x60, &pR) && pR) VisReadU32(pR, 0, &r);
+            objs += total;
+            cCulled += w;
+            cGathered += r;
+            if (pW != pR) ++cUnpaired;
+        }
+        if (cSegs && len < 440)
+            len += snprintf(cats + len, sizeof(cats) - len, " c%d:%d/%d/%lld/%lld/%d", c, cSegs, cActive, cCulled, cGathered,
+                            cUnpaired);
+        segs += cSegs;
+        active += cActive;
+        culled += cCulled;
+        gathered += cGathered;
+        unpaired += cUnpaired;
+    }
+    Log("VISPROBE pass=%d eye=%d %-6s vis=%p idx=%u block=%p rooms=%u visible=%u lights=%u | segs=%d active=%d objs=%lld "
+        "culled=%lld gathered=%lld unpaired=%d |%s",
+        g_recordingPass.load(), g_recordingEye.load(), at, vis, idx, block, nRooms, nVis, nLights, segs, active, objs,
+        culled, gathered, unpaired, cats);
+}
+
+// ---- EXP-053: the per-frame primitive budget, given to every eye pass ------------------------------------------------
+// STATIC: every drawn primitive (G-buffer, shadow maps, reflections ...) is packed by FUN_14028cc70 .. FUN_14028f310 /
+// FUN_140876c00: 0x1000 bytes reserved from one arena (g_scenePrimitives 0x141ca87b0 +0x200; FUN_140887c00 builds it
+// with FUN_140bd3e00(arena, 0x200000, grow = 0): ONE fixed 2 MB block), the used size committed, then a 32-byte entry
+// appended to one of 30 sorted lists (+0x110 + i*8; fixed buffers of 4000 / 2000 / ... entries, FUN_140885bc0). Both
+// fail SILENTLY when full: FUN_140bd40b0 returns 0 and the packer returns; a full list returns before appending.
+// FUN_140886a20 rewinds the 30 lists and the arena; its only caller is DISPLAY_WINDOW::Display (FUN_140851430), right
+// BEFORE VIEWPORT_LIST::Display, i.e. once per frame, while B2SVR records VIEWPORT_LIST::Display once per eye. In a
+// heavy scene (0801 The Party) the left eye used most of the budget and the right eye's primitives were dropped: LIVE
+// 0.21.1, the right pass gathered ~1387 visible objects (left ~1392) but drew 3 G-buffer draws (left 1624). Fix: the
+// right-eye pass starts with the game's own rewind, as a frame would - only after the left pass's B2SVR:SYNC was
+// reached (EXP-030: the render thread has executed every left-eye command, so nothing reads that data any more).
+// `framebudget off` restores the old shared budget (A/B).
+std::atomic<bool> g_framePerEye{true};
+std::atomic<uint64_t> g_budgetResets{0}, g_budgetSkips{0};
+using ResetPrimitivesFn = void (*)(void* primitives);
+constexpr uintptr_t kScenePrimitivesVa = 0x141ca87b0, kResetPrimitivesVa = 0x140886a20;
+constexpr uintptr_t kPrimArena = 0x200, kPrimLists = 0x110;
+constexpr int kPrimListCount = 30;
+
+void* ScenePrimitives() {
+    const uintptr_t va = game::Va(kScenePrimitivesVa);
+    uint8_t* p = nullptr;
+    return va && VisReadPtr(reinterpret_cast<void*>(va), 0, &p) ? p : nullptr;
+}
+
+// Right-eye pass start: the per-frame rewind, as DISPLAY_WINDOW::Display does before the left eye.
+void GivePassFrameBudget(int pass) {
+    static auto reset = reinterpret_cast<ResetPrimitivesFn>(game::Va(kResetPrimitivesVa));
+    void* prim = ScenePrimitives();
+    if (!reset || !prim) return;
+    reset(prim);
+    if (g_budgetResets++ == 0)
+        Log("STEREO frame budget: eye pass %d starts with the game's per-frame primitive budget (EXP-053)", pass);
+}
+
+// `visprobe` companion: how full the primitive arena and the 30 sorted lists are.
+void BudgetProbe(const char* at) {
+    uint8_t *prim = static_cast<uint8_t*>(ScenePrimitives()), *arena = nullptr, *blocks = nullptr;
+    if (!prim || !VisReadPtr(prim, kPrimArena, &arena) || !arena || !VisReadPtr(arena, 8, &blocks) || !blocks) {
+        Log("BUDGET pass=%d eye=%d %-6s no primitive manager", g_recordingPass.load(), g_recordingEye.load(), at);
+        return;
+    }
+    uint32_t blockSize = 0, count = 0, current = 0, grows = 0;
+    VisReadU32(arena, 0, &blockSize);
+    VisReadU32(arena, 0x10, &count);
+    VisReadU32(arena, 0x1c, &current);
+    VisReadU32(arena, 0x18, &grows);
+    unsigned long long used = 0;
+    for (uint32_t b = 0; b < count && b < 64; ++b) {
+        uint8_t *blk = nullptr, *base = nullptr, *cur = nullptr;
+        if (VisReadPtr(blocks, size_t(b) * 8, &blk) && blk && VisReadPtr(blk, 0, &base) && VisReadPtr(blk, 0x10, &cur) &&
+            cur >= base)
+            used += uint64_t(cur - base);
+    }
+    int full = 0, fullest = -1;
+    long long entries = 0;
+    double worst = 0.0;
+    uint32_t worstFill = 0, worstCap = 0;
+    for (int i = 0; i < kPrimListCount; ++i) {
+        uint8_t *l = nullptr, *base = nullptr, *end = nullptr;
+        uint32_t cap = 0;
+        if (!VisReadPtr(prim, kPrimLists + size_t(i) * 8, &l) || !l || !VisReadU32(l, 0, &cap) || !VisReadPtr(l, 8, &base) ||
+            !VisReadPtr(l, 0x10, &end) || end < base || !cap)
+            continue;
+        const uint32_t fill = uint32_t((end - base) / 0x20);
+        entries += fill;
+        if (fill + 1 > cap) ++full;
+        const double r = double(fill) / double(cap);
+        if (r > worst) worst = r, fullest = i, worstFill = fill, worstCap = cap;
+    }
+    Log("BUDGET pass=%d eye=%d %-6s arena %llu KB used of %u KB x %u block(s) (current %u, grows %u) | lists: %lld entries, "
+        "%d full, fullest #%d %u/%u",
+        g_recordingPass.load(), g_recordingEye.load(), at, used / 1024, blockSize / 1024, count, current, grows & 0xff,
+        entries, full, fullest, worstFill, worstCap);
+}
+
+constexpr int kStageGbufferCull = 9;     // 0x140889a20 -> FUN_14086b090 -> FUN_140896350 (G-buffer visibility)
+constexpr int kStageGbufferGather = 12;  // 0x140889770 -> FUN_14086ab10 -> FUN_140896460 (SCENE_GRAPH::FillGBuffer)
+
 template <int I>
 void HookStage(void* a, void* b, void* c, void* d) {
     if (g_stageMarks && g_curCmdbuf) EmitMarker(g_curCmdbuf, kStageMarker[I]);
+    if constexpr (I == kStageReflection) if (g_reflProbe.load(std::memory_order_relaxed) > 0) {
+        g_reflProbe.fetch_sub(1);
+        ReflProbe();
+    }
     if (g_skipStages.load() & (1u << I)) return;
     g_origStage[I](a, b, c, d);
+    if constexpr (I == kStageGbufferCull || I == kStageGbufferGather)
+        if (g_visProbe.load(std::memory_order_relaxed) > 0 && g_recordingPass >= 0)
+            VisProbe(I == kStageGbufferCull ? "cull" : "gather");
 }
 
 template <int... I>
@@ -724,6 +971,7 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, 
     xr::ReleaseBackbufferViews();
     const HRESULT hr = g_origResizeBuffers(sc, n, w, h, f, flags);
     Log("STEREO ResizeBuffers %ux%u -> 0x%08lx", w, h, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) crash::NoteDeviceLost("ResizeBuffers", hr, sc);
     return hr;
 }
 ID3D11Texture2D* g_eyeTex[kMaxPasses] = {};
@@ -833,6 +1081,97 @@ void LumTrace(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src,
     if (eye == 1) g_lumFrames--;
 }
 
+// ---- GPU time of the eye passes (g_gpu; render thread, g_bbMutex held) ----
+void GpuPoll(ID3D11DeviceContext* ctx) {
+    for (int i = 0; i < GpuTimer::kN; ++i) {
+        if (!g_gpu.pending[i]) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        if (ctx->GetData(g_gpu.disjoint[i], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+        UINT64 a = 0, b = 0;
+        if (ctx->GetData(g_gpu.t0[i], &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            ctx->GetData(g_gpu.t1[i], &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        g_gpu.pending[i] = false;
+        if (g_gpu.discard[i] || dj.Disjoint || !dj.Frequency || b < a) continue;
+        const double ms = 1000.0 * double(b - a) / double(dj.Frequency);
+        g_gpu.sumMs += ms;
+        if (ms > g_gpu.maxMs) g_gpu.maxMs = ms;
+        g_gpu.samples++;
+    }
+}
+
+void GpuEnd(ID3D11DeviceContext* ctx, bool discard = false) {
+    const int i = g_gpu.open;
+    if (i < 0) return;
+    ctx->End(g_gpu.t1[i]);
+    ctx->End(g_gpu.disjoint[i]);
+    g_gpu.pending[i] = true;
+    g_gpu.discard[i] = discard;
+    g_gpu.open = -1;
+}
+
+void GpuBegin(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    if (g_gpu.failed || !dev || !ctx) return;
+    if (!g_gpu.disjoint[0]) {
+        D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+        D3D11_QUERY_DESC qt{D3D11_QUERY_TIMESTAMP, 0};
+        for (int i = 0; i < GpuTimer::kN; ++i)
+            if (FAILED(dev->CreateQuery(&qd, &g_gpu.disjoint[i])) || FAILED(dev->CreateQuery(&qt, &g_gpu.t0[i])) ||
+                FAILED(dev->CreateQuery(&qt, &g_gpu.t1[i]))) {
+                g_gpu.failed = true;
+                Log("STEREO GPU timer: queries not available");
+                return;
+            }
+    }
+    GpuEnd(ctx, /*discard=*/true);  // a frame whose last eye never came (a stalled pair)
+    GpuPoll(ctx);
+    for (int i = 0; i < GpuTimer::kN; ++i) {
+        if (g_gpu.pending[i]) continue;
+        ctx->Begin(g_gpu.disjoint[i]);
+        ctx->End(g_gpu.t0[i]);
+        g_gpu.open = i;
+        return;
+    }
+}
+
+// Every 30 s while VR draws: which eyes the frames drew and their GPU time (render thread, g_bbMutex held).
+void LogFrameStats() {
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (!last) last = now;
+    if (now - last < 30000) return;
+    last = now;
+    const uint64_t l = g_afrFrames[0].exchange(0), r = g_afrFrames[1].exchange(0), both = g_bothFrames.exchange(0),
+                   mono = g_monoFrames.exchange(0);
+    if (!l && !r && !both && !mono) return;
+    if (g_gpu.samples)
+        Log("STEREO frames (last 30 s, %s): one eye %llu (left %llu, right %llu), both eyes %llu, mono %llu; GPU time "
+            "of the eye passes %.2f ms per frame (max %.2f, %llu samples)",
+            MethodName(g_method), l + r, l, r, both, mono, g_gpu.sumMs / double(g_gpu.samples), g_gpu.maxMs,
+            g_gpu.samples);
+    else
+        Log("STEREO frames (last 30 s, %s): one eye %llu (left %llu, right %llu), both eyes %llu, mono %llu; no GPU time",
+            MethodName(g_method), l + r, l, r, both, mono);
+    if (const uint64_t u = g_stampsUnkeyed.exchange(0))
+        Log("STEREO probe-lighting stamps given back their frame number (EXP-048): %llu in 30 s", u);
+    {
+        static uint64_t lastGiven = 0, lastSkipped = 0;
+        const uint64_t given = g_budgetResets.load(), skipped = g_budgetSkips.load();
+        if (given != lastGiven || skipped != lastSkipped)
+            Log("STEREO per-eye frame budget (EXP-053): given to %llu right-eye passes, skipped %llu (no pass sync) in 30 s",
+                given - lastGiven, skipped - lastSkipped);
+        lastGiven = given;
+        lastSkipped = skipped;
+    }
+    if (const uint64_t rec = g_vpRecords.exchange(0))
+        Log("STEREO viewport state records in eye passes (EXP-049): %llu, %llu of them with another camera's view",
+            rec, g_vpStale.exchange(0));
+    texguard::LogStats();
+    zonefix::LogStats();
+    g_gpu.sumMs = g_gpu.maxMs = 0.0;
+    g_gpu.samples = 0;
+}
+
 void CopyEye(int eye, int slot) {
     std::lock_guard lock(g_bbMutex);
     ID3D11Texture2D* bb = g_bb;
@@ -856,17 +1195,22 @@ void CopyEye(int eye, int slot) {
         Log("STEREO eye textures %ux%u fmt=%d", d.Width, d.Height, int(d.Format));
     }
     if (g_eyeTex[eye]) ctx->CopyResource(g_eyeTex[eye], bb);
+    // Mono: the right eye's last image is the same picture (a stalled frame re-shows both at the centre pose).
+    if (slot >= 0 && eye == 0 && xr::IsMono(slot) && g_eyeTex[1]) ctx->CopyResource(g_eyeTex[1], bb);
+    if (slot >= 0 && eye < 2 && (xr::SingleEye(slot) >= 0 || eye == 1)) GpuEnd(ctx);  // the frame's last eye
     if (g_lumFrames > 0 && g_eyeTex[eye] && eye <= 1) LumTrace(dev, ctx, g_eyeTex[eye], eye);
     if (slot >= 0 && eye < 2 && g_eyeTex[eye]) {
         // The 3D scene occupies a centred band of the backbuffer (full height with the
         // letterbox off in VR).
         uint32_t top = 0, h = d.Height;
         SceneBand(d.Width, d.Height, top, h);
-        xr::OnEye(eye, slot, ctx, g_eyeTex[eye], top, h, /*uiFollows=*/eye == 1 && g_capture);
+        // The pair's last eye (eye 1, or the only eye of an AFR pair) leaves the frame to the UI end.
+        const int single = xr::SingleEye(slot);
+        xr::OnEye(eye, slot, ctx, g_eyeTex[eye], top, h, /*uiFollows=*/(single >= 0 || eye == 1) && g_capture);
     }
     const uint64_t n = g_eyeCopies[eye]++;
     if (n < 4) Log("STEREO copied eye %d (#%llu) on thread %lu", eye, n, GetCurrentThreadId());
-    if (eye == g_passes - 1) {
+    if (eye == g_passes - 1 || (slot >= 0 && xr::SingleEye(slot) == eye)) {
         std::string shot;
         {
             std::lock_guard shotLock(g_shotMutex);
@@ -895,6 +1239,42 @@ void HookAllStages(std::integer_sequence<int, I...>) {
      ...);
 }
 
+// ---- EXP-048: frame-numbered stamps under the eye keys ----------------------------------------------
+// The eye passes key RenderState+0xBF4 (EXP-021: frame ^ 0x20000000 left, ^ 0x40000000 right) for the caches that
+// test "== this frame". Some stamps are ORDERED instead, and a keyed stamp is larger than any frame number. Crash
+// (player, 0.17.14, 1801 HUNTED TRAIN): FUN_1409bc600 read the colour data (+8) of probe 0 = null. STATIC:
+// FUN_1408e1cf0 (a skeleton's probe lighting, called from FUN_1409d7780 / 1409d7f40 in the drawn list) stamps
+// skeleton+0x290 = +0xBF4 and relights when that stamp is below lightGrid+0x60; its probe cache FUN_1409aca40
+// (skeleton+0x1b8, only caller FUN_1408e1cf0) keeps up to 5 probe pointers (+0x48) and gathers them again only when
+// its stamp (+0x44) is below RenderState+0xBF8, which SCENE_ZONE::vfunc_110 / vfunc_111 set to +0xBF4 whenever a
+// zone enters or leaves the scene (they release the zone's probes, FUN_1409739d0 / FUN_14092dd40). A cache stamped
+// in an eye pass carried the key, so no later zone change was ever "after" it: the cache kept the probes of a zone
+// the game had removed. The hook strips the key from both stamps around the call: they hold the frame number, as
+// in the game; the stamps belong to the skeleton the game function is itself writing.
+constexpr uint32_t kEyeKey[2] = {0x20000000u, 0x40000000u};
+constexpr uint32_t kEyeKeyBits = kEyeKey[0] | kEyeKey[1];
+constexpr uintptr_t kSkelLightStamp = 0x290, kSkelProbeCache = 0x1b8, kProbeCacheStamp = 0x44;
+using SkelLightingFn = void (*)(void* skeleton);
+SkelLightingFn g_origSkelLighting = nullptr;
+
+void UnkeyStamp(uint32_t* stamp) {
+    if (*stamp & kEyeKeyBits) {
+        *stamp &= ~kEyeKeyBits;
+        g_stampsUnkeyed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+void UnkeySkeletonStamps(uint8_t* skel) {
+    UnkeyStamp(reinterpret_cast<uint32_t*>(skel + kSkelLightStamp));
+    if (auto* cache = *reinterpret_cast<uint8_t**>(skel + kSkelProbeCache))
+        UnkeyStamp(reinterpret_cast<uint32_t*>(cache + kProbeCacheStamp));
+}
+void HookSkelLighting(void* skeleton) {
+    auto* skel = static_cast<uint8_t*>(skeleton);
+    if (skel) UnkeySkeletonStamps(skel);
+    g_origSkelLighting(skeleton);
+    if (skel) UnkeySkeletonStamps(skel);  // the cache may be new, and both stamps were just written
+}
+
 }  // namespace
 
 void Install() {
@@ -907,6 +1287,10 @@ void Install() {
             g_xrWanted = true;
             Log("b2svr.ini: xr=on (session starts on the first rendered frame)");
         }
+        GetPrivateProfileStringW(L"b2svr", L"rendering_method", L"native", ini, MAX_PATH, path.c_str());
+        g_method = _wcsicmp(ini, L"afr") == 0 ? kAfr : _wcsicmp(ini, L"mono") == 0 ? kMono : kNative;
+        xr::SetMono(g_method == kMono);
+        Log("b2svr.ini: rendering_method=%s", MethodName(g_method));
     }
     HookAllStages(std::make_integer_sequence<int, kStageCount>{});
     {
@@ -940,7 +1324,11 @@ void Install() {
          reinterpret_cast<void**>(&g_origDisplay2D), "VIEWPORT_LIST::Display2D");
     videowatch::Install();  // full-screen videos in the 2D layer (xr::OnUiEnd)
     rendersize::Install();  // square render size in VR (b2svr.ini render_size)
+    audio::Install();       // the sound listener follows the headset (b2svr.ini audio_head)
+    storyvars::Install();   // read-only: story variables for crash reports (before the developer tools)
     InstallCullView();
+    InstallViewportSnapshot();
+    devtools::Install();  // developer build only (devtools.h); nothing in the release build
     fpcam::Install();
     Hook(Addr(Anchor::CloseupLightsAttach), reinterpret_cast<void*>(&HookCloseupAttach),
          reinterpret_cast<void**>(&g_origCloseupAttach), "CLOSEUP_LIGHTING::Attach");
@@ -948,6 +1336,13 @@ void Install() {
          reinterpret_cast<void**>(&g_origPreParticles), "VIEWPORT_LIST::PreUpdParts");
     Hook(Addr(Anchor::PostUpdateParticles), reinterpret_cast<void*>(&HookPostParticles),
          reinterpret_cast<void**>(&g_origPostParticles), "VIEWPORT_LIST::PostUpdParts");
+    // EXP-048: the probe-lighting stamps keep frame numbers under the eye keys (a missing address only leaves the
+    // crash fix off).
+    if (void* sl = reinterpret_cast<void*>(game::Va(0x1408e1cf0)))
+        Hook(sl, reinterpret_cast<void*>(&HookSkelLighting), reinterpret_cast<void**>(&g_origSkelLighting),
+             "SKELETON::ProbeLighting");
+    texguard::Install();  // EXP-054: destroyed textures left in shader slots are cleared before they are bound
+    zonefix::Install();   // 0.24.0: the eye's room from the engine's point lookup; all-rooms query between rooms
 }
 
 // ---- diagnostic: snapshot engine state around each pass (find accumulators) ----------
@@ -1039,6 +1434,7 @@ std::atomic<bool> g_tailLeft{false};  // EXP-026: refuted (owner: still unstable
 void RestoreEngineFov();
 void PrimeEyeCamera();
 void PrimeViewports(void* list, void* cmdbuf);
+void RefreshViewportSnapshot(uint8_t* vp);  // EXP-049
 std::atomic<bool> g_engineFov{true};  // EXP-016: owner saw culling cut at top/bottom/sides
 void ApplyEngineFov(void* camp);
 std::atomic<bool> g_nodePass{true};  // EXP-018
@@ -1047,6 +1443,7 @@ void SetNodeRelative(uint8_t* node, const pose::Mat4& rel);
 pose::Mat4 AuthoredCameraWorld(uint8_t* node);
 pose::Mat4 EyeRel(int eye);
 pose::Mat4 NodeRel(int eye);
+pose::Mat4 CenterRel();
 std::atomic<bool> g_aoOff{false};  // EXP-016
 void RestoreEngineFov();
 // EXP-013 discriminators (off by default).
@@ -1095,7 +1492,7 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
         }
     }
     UpdateCinema(g_xrOwnsStereo);
-    vrinput::Publish(frameInput, false, 0.f);
+    vrinput::Publish(devtools::Filter(frameInput), false, 0.f);  // F7 menu open: the game gets no buttons
     {
         // The cameras of this list: every enabled viewport's camera gets the eye pose; the first
         // one is the scene camera (aspect / letterbox).
@@ -1155,11 +1552,22 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
         g_mainCam = cam;
         if (cam) g_sceneAspect = Read<float>(cam, 0x11C);
     }
+    bool headPublished = false;
     if (g_curSlot >= 0 && g_on) {
-        if (uint8_t* node = g_mainCam ? CameraNode(g_mainCam) : nullptr)
-            fpcam::Prepare(node, AuthoredCameraWorld(node), frameInput);
-        else fpcam::Suspend();
+        if (uint8_t* node = g_mainCam ? CameraNode(g_mainCam) : nullptr) {
+            const pose::Mat4 authored = AuthoredCameraWorld(node);
+            fpcam::Prepare(node, authored, frameInput);
+            // EXP-044: the sound listener gets the head these eyes are rendered from (between the eyes, on the
+            // same base as SetNodeRelative: the game camera, or the first-person base).
+            if (g_haveXrEyes) {
+                pose::Mat4 base = authored;
+                fpcam::Base(node, &base);
+                audio::Publish(pose::Mul(CenterRel(), base), authored, true);
+                headPublished = true;
+            }
+        } else fpcam::Suspend();
     } else fpcam::Suspend();
+    if (!headPublished) audio::Publish(pose::Identity(), pose::Identity(), false);
     // EXP-016: `ao off` clears the engine's per-viewport AO switch (VIEWPORT+0x890 bit9, checked
     // by FUN_1408695f0 before ComputeAmbientOcclusion) for this recording; restored afterwards.
     uint32_t* aoFlags[8] = {};
@@ -1190,7 +1598,49 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
     }
     fpcam::BeginRender();
     zonefix::Frame();
-    const int passes = g_passes;
+    texguard::RefillDrawn();  // EXP-054 s.8: shaders drawn without the engine's per-frame refill get it
+    int passes = g_passes, firstEye = 0;
+    // AFR: one alternating eye per frame, while the other eye still holds a recent image; otherwise (the
+    // start, after menus or a recenter) both eyes this frame.
+    // Mono (playbook 18.7): xr made both eyes of this frame the head centre (xr::IsMono); one pass, always eye 0,
+    // so the game's temporal history runs on one camera; xr shows the picture to both eyes.
+    bool afrFrame = false, monoFrame = false;
+    const int method = g_method;
+    if (method == kMono && passes == 2 && g_haveXrEyes && g_curSlot >= 0 && xr::IsMono(g_curSlot)) {
+        monoFrame = true;
+        firstEye = 0;
+        passes = 1;
+        xr::SetSingleEye(g_curSlot, 0);
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            Log("STEREO Mono: one centre-of-head picture per frame for both eyes");
+        }
+    } else if (method == kAfr && passes == 2 && g_haveXrEyes && g_curSlot >= 0) {
+        const int e = g_afrNext;
+        if (xr::CanKeepEye(1 - e)) {
+            afrFrame = true;
+            firstEye = e;
+            passes = 1;
+            g_afrNext = 1 - e;
+        } else {
+            g_afrNext = 1;  // both now; the next frame starts alternating with the right eye
+        }
+        xr::SetSingleEye(g_curSlot, afrFrame ? e : -1);
+        static bool reported = false;
+        if (afrFrame != reported) {
+            reported = afrFrame;
+            Log(afrFrame ? "STEREO AFR: one eye per frame (eye %d now)" : "STEREO AFR: both eyes this frame (no recent image to keep)", e);
+        }
+    } else if (g_curSlot >= 0) {
+        xr::SetSingleEye(g_curSlot, -1);
+    }
+    if (g_haveXrEyes && g_curSlot >= 0) {
+        if (monoFrame) g_monoFrames++;
+        else if (afrFrame) g_afrFrames[firstEye]++;
+        else if (passes >= 2) g_bothFrames++;
+        if (g_capture) EmitMarker(cmdbuf, kGpuMarker);  // GPU timer start (render thread, OnMarker)
+    }
     FILE* dump = nullptr;
     if (g_diffDump.exchange(false)) {
         const std::wstring path = GameDir() + L"\\b2svr_passdump.bin";
@@ -1200,9 +1650,20 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
     uint32_t* lights = SceneLightCount(list);
     const uint32_t lightsBefore = lights ? *lights : 0;
     uint32_t lightsAfter[kMaxPasses] = {};
-    for (int eye = 0; eye < passes; ++eye) {
-        if (eye > 0 && lights && g_lightFix) *lights = lightsBefore;
+    bool leftPassDone = false;  // the render thread reached B2SVR:SYNC after the previous pass (EXP-030)
+    for (int pass = 0; pass < passes; ++pass) {
+        const int eye = firstEye + pass;
+        if (pass > 0 && lights && g_lightFix) *lights = lightsBefore;
+        // EXP-053: every eye pass gets the game's per-frame primitive budget. Without the sync the previous pass may
+        // still be executing from that memory, so it is left shared (counted, logged with the 30 s stats).
+        if (pass > 0 && g_framePerEye) {
+            if (leftPassDone) GivePassFrameBudget(pass);
+            else g_budgetSkips++;
+        }
+        leftPassDone = false;
         g_recordingEye = eye;
+        g_recordingPass = pass;
+        g_recordingLast = pass == passes - 1;
         // EXP-018: the eye pose is on every stereo camera node from the START of the pass, so the
         // viewport setup's reads before CAMERA::Build see the same pose as everything after it.
         if (g_nodePass && g_haveXrEyes && eye <= 1)
@@ -1228,21 +1689,43 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
             if (void* rs = *reinterpret_cast<void**>(game::Va(kCinemaRenderStateVa))) {
                 frameCounter = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(rs) + kFrameCounterOff);
                 savedCounter = *frameCounter;
-                *frameCounter = savedCounter ^ (eye == 0 ? 0x20000000u : 0x40000000u);
+                *frameCounter = savedCounter ^ kEyeKey[eye];
             }
         }
         // 0.16.35: the visibility pass starts from the room the eye is in (zonefix.h).
         zonefix::BeginPass(g_stereoCams, g_stereoCamCount);
+        const bool visProbe = g_visProbe.load(std::memory_order_relaxed) > 0;
+        if (visProbe) {
+            VisProbe("start");
+            BudgetProbe("start");
+        }
         orig(list, cmdbuf, mode, flag);
+        if (visProbe) {
+            VisProbe("end");
+            BudgetProbe("end");
+            g_visProbe.fetch_sub(1);
+        }
         zonefix::EndPass();
-        if (frameCounter) *frameCounter = savedCounter;
-        if (g_passSync && eye == 0 && passes >= 2 && g_haveXrEyes) {
+        if (frameCounter) {
+            *frameCounter = savedCounter;
+            // EXP-048: a zone entering / leaving during the pass set the probe epoch (+0xBF8) from the keyed counter,
+            // above every frame number: every probe cache would then gather again on every call until the next zone
+            // change. Back to this frame's number, as the game would have written.
+            auto* epoch = frameCounter + 1;  // RenderState+0xBF8
+            if (*epoch & kEyeKeyBits) {
+                *epoch &= ~kEyeKeyBits;
+                static int logs = 0;
+                if (logs++ < 5) Log("STEREO probe epoch set during eye pass %d: key removed (frame %u)", eye, *epoch);
+            }
+        }
+        if (g_passSync && pass == 0 && passes >= 2 && g_haveXrEyes) {
             ResetEvent(g_syncEvent);
             EmitMarker(cmdbuf, "B2SVR:SYNC");
             LARGE_INTEGER f, t0, t1;
             QueryPerformanceFrequency(&f);
             QueryPerformanceCounter(&t0);
             const bool ok = WaitForSingleObject(g_syncEvent, 40) == WAIT_OBJECT_0;
+            leftPassDone = ok;
             QueryPerformanceCounter(&t1);
             const double ms = 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart);
             const uint64_t n = ++g_syncWaits;
@@ -1255,14 +1738,14 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
         // EXP-030: the render thread reads the camera node / FOV scalars when it EXECUTES the pass.
         // Left eye: restored only after the sync wait above (its commands have executed). Last eye:
         // kept until Present, where the render thread is idle (EXP-011), then restored there.
-        if (g_passSync && g_haveXrEyes && passes >= 2 && eye == passes - 1) {
+        if (g_passSync && g_haveXrEyes && (passes >= 2 || afrFrame || monoFrame) && pass == passes - 1) {
             g_restoreAtPresent = true;
         } else {
             RestoreNode();  // the next pass (and game logic after the last one) sees the original node
             RestoreEngineFov();
         }
         if (lights) lightsAfter[eye] = *lights;
-        if (dump) Snapshot(dump, uint32_t(eye + 1), list);
+        if (dump) Snapshot(dump, uint32_t(pass + 1), list);
     }
     if (dump) {
         fclose(dump);
@@ -1272,10 +1755,12 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
     // EXP-026: after the last (right-eye) pass the camera object and the camera globals hold the
     // RIGHT eye; the engine's work between frames then fed the next frame's LEFT eye with right-eye
     // state (eyesame fixed it). Leave the camera in the left-eye state instead.
-    if (g_tailLeft && g_haveXrEyes && passes >= 2) {
-        g_recordingEye = 0;
+    // AFR: the eye the next frame draws (Mono: eye 0, the centre).
+    if (g_tailLeft && g_haveXrEyes && (passes >= 2 || afrFrame || monoFrame)) {
+        const int tail = afrFrame ? g_afrNext : 0;
+        g_recordingEye = tail;
         for (int k = 0; k < g_stereoCamCount; ++k) {
-            if (uint8_t* node = CameraNode(g_stereoCams[k])) SetNodeRelative(node, EyeRel(0));
+            if (uint8_t* node = CameraNode(g_stereoCams[k])) SetNodeRelative(node, EyeRel(tail));
             if (g_engineFov) ApplyEngineFov(g_stereoCams[k]);
         }
         PrimeEyeCamera();
@@ -1283,6 +1768,8 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
         RestoreEngineFov();
     }
     g_recordingEye = -1;
+    g_recordingPass = -1;
+    g_recordingLast = false;
     g_pairsRecorded++;
     // UI boundary (EXP-011): MenusMaster records its draws after VIEWPORT_LIST::Display returns
     // and before Present. The render thread clears the backbuffer to transparent here, the UI
@@ -1320,6 +1807,11 @@ bool OnMarker(const char* name) {
         SetEvent(g_syncEvent);
         return true;
     }
+    if (name == kGpuMarker || std::strcmp(name, kGpuMarker) == 0) {
+        std::lock_guard lock(g_bbMutex);
+        GpuBegin(g_dev, g_ctx);
+        return true;
+    }
     if (std::strncmp(name, "B2SVR:UI", 8) == 0 && (name[8] == 'B' || name[8] == 'E') && name[9] == ':') {
         const int slot = std::atoi(name + 10);
         std::lock_guard lock(g_bbMutex);
@@ -1327,14 +1819,14 @@ bool OnMarker(const char* name) {
             if (name[8] == 'B')
                 xr::OnUiBegin(slot, g_ctx, g_bb);
             else
-                xr::OnUiEnd(slot, g_ctx, g_bb, g_eyeTex[1]);
+                xr::OnUiEnd(slot, g_ctx, g_bb, g_eyeTex[xr::SingleEye(slot) == 0 ? 0 : 1]);
         }
         return true;
     }
     if (std::strncmp(name, "B2SVR:EYE", 9) != 0) return false;
     const int eye = name[9] - '0';
     const int slot = name[10] == ':' ? std::atoi(name + 11) : -1;
-    if (eye >= 0 && eye < g_passes) CopyEye(eye, slot);
+    if (eye >= 0 && (eye < g_passes || eye < 2)) CopyEye(eye, slot);
     return true;
 }
 
@@ -1746,10 +2238,89 @@ void PrimeViewports(void* list, void* cmdbuf) {
         const uint32_t flags = Read<uint32_t>(vp, off::VpFlags);
         if (!(flags & 1) || (flags >> 17 & 1) || !Read<void*>(vp, off::VpCamera)) continue;
         setup(vp, cmdbuf);
+        RefreshViewportSnapshot(static_cast<uint8_t*>(vp));  // EXP-049: the globals hold this viewport's camera now
         ++n;
     }
     static int logs = 0;
     if (logs++ < 2) Log("STEREO primed %d viewport(s) for eye %d", n, g_recordingEye.load());
+}
+
+// ---- EXP-049: the viewport's camera snapshot in every eye pass ----------------------------------------------------
+// STATIC: VIEWPORT::RecordState FUN_14086bb20 copies 0x590 bytes of the viewport from +0x170 into the command stream
+// (render command 8, FUN_1402550b0 - a copy, not a pointer); the render thread points ctx+0x278 at it and its
+// screen-space passes read it (AO FUN_140814230: c0 = depth terms from near / far +0x6c0 / +0x6c4 via FUN_140c9b900,
+// c1 = (P23 / P00, P23 / P11, -far, 1) from the projection +0x670, computed in FUN_14086bb20). The snapshot's view
+// (+0x170 <- CAMERA+0x280) and projection (+0x670 <- 0x141c8f180, as VIEWPORT::Setup published it, jitter included)
+// are written by FUN_14086b540 alone (exhaustive search of the decompile), at its END, after the FUN_14086bb20 at its
+// start already recorded the copy. The main-scene stage 0x140889ba0 (the first to record it in a pass) and the
+// stages before any FUN_14086b540 of the pass thus carried the PREVIOUS pass's camera: in VR the other eye, 6.4 cm
+// away and, for the left eye, one frame old. PrimeViewports builds each viewport's camera for this eye at the pass
+// start (VIEWPORT::Setup, which publishes CAMERA+0x280 / +0x240 to 0x141c8f100 / 0x141c8f180); the snapshot is
+// refreshed there from the same sources FUN_14086b540 uses, so every record of the pass carries this eye.
+std::atomic<bool> g_vpSnapshot{true};
+constexpr uintptr_t kVpSnapView = 0x170, kVpSnapProj = 0x670;
+constexpr uintptr_t kView1GlobalVa = 0x141c8f100, kProj1GlobalVa = 0x141c8f180;
+void RefreshViewportSnapshot(uint8_t* vp) {
+    if (!g_vpSnapshot || !vp) return;
+    auto* cam = static_cast<uint8_t*>(ResolveHandle(Read<void*>(vp, off::VpCamera)));
+    if (!cam) return;
+    const auto* view1 = reinterpret_cast<const uint8_t*>(game::Va(kView1GlobalVa));
+    const auto* proj1 = reinterpret_cast<const uint8_t*>(game::Va(kProj1GlobalVa));
+    // Only when the setup just published THIS camera (it can skip the publish): the projection then is this
+    // camera's, as FUN_14086b540 would copy it later in the pass.
+    if (!view1 || !proj1 || std::memcmp(view1, cam + off::CamView, 64) != 0) {
+        static int logs = 0;
+        if (logs++ < 3) Log("STEREO viewport %p: published camera is not its own; snapshot left as it was", vp);
+        return;
+    }
+    std::memcpy(vp + kVpSnapView, cam + off::CamView, 64);
+    std::memcpy(vp + kVpSnapProj, proj1, 64);
+}
+
+// LIVE check and diagnostic around every record (FUN_14086bb20) in an eye pass: counts records whose snapshot view
+// is not the camera the pass renders with, and `vppoison view|proj` corrupts the recorded copy on purpose (restored
+// right after) so eye captures show which effects read it.
+using RecordStateFn = void (*)(void* vp, void* cmdbuf, uint32_t index);
+RecordStateFn g_origRecordState = nullptr;
+std::atomic<int> g_vpPoison{0};  // 0 off, 1 view (30 cm to the side), 2 projection (20 % wider)
+void HookRecordState(void* vpp, void* cmdbuf, uint32_t index) {
+    auto* vp = static_cast<uint8_t*>(vpp);
+    const int eye = g_recordingEye;
+    uint8_t* cam = nullptr;
+    if (vp && eye >= 0 && eye <= 1 && g_haveXrEyes)
+        cam = static_cast<uint8_t*>(ResolveHandle(Read<void*>(vp, off::VpCamera)));
+    if (cam && IsStereoCam(cam)) {
+        g_vpRecords.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(vp + kVpSnapView, cam + off::CamView, 64) != 0) {
+            g_vpStale.fetch_add(1, std::memory_order_relaxed);
+            static int logs = 0;
+            if (logs++ < 6)
+                Log("STEREO viewport record with another camera's view (eye %d, vp %p, caller exe+0x%llx)", eye, vp,
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(_ReturnAddress()) -
+                                                    reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))));
+        }
+    }
+    const int poison = cam ? g_vpPoison.load() : 0;
+    float saved[16];
+    float* m = nullptr;
+    if (poison == 1 || poison == 2) {
+        m = reinterpret_cast<float*>(vp + (poison == 1 ? kVpSnapView : kVpSnapProj));
+        std::memcpy(saved, m, sizeof(saved));
+        if (poison == 1) {
+            m[12] += 0.3f;  // view-space X: the camera 30 cm to the side
+        } else {
+            m[0] *= 0.8f;  // 20 % wider
+            m[5] *= 0.8f;
+        }
+    }
+    g_origRecordState(vpp, cmdbuf, index);
+    if (m) std::memcpy(m, saved, sizeof(saved));
+}
+
+void InstallViewportSnapshot() {
+    if (void* rs = reinterpret_cast<void*>(game::Va(0x14086bb20)))
+        Hook(rs, reinterpret_cast<void*>(&HookRecordState), reinterpret_cast<void**>(&g_origRecordState),
+             "VIEWPORT::RecordState");
 }
 
 void InstallCullView() {
@@ -1869,7 +2440,8 @@ void BeforePresent() {
     // (EXP-011: recorded=0 replayed=0), so the immediate context is free on this thread.
     std::lock_guard lock(g_bbMutex);
     if (!g_bb || !g_ctx) return;
-    if (slot >= 0) xr::OnUiEnd(slot, g_ctx, g_bb, g_eyeTex[1]);
+    LogFrameStats();
+    if (slot >= 0) xr::OnUiEnd(slot, g_ctx, g_bb, g_eyeTex[xr::SingleEye(slot) == 0 ? 0 : 1]);
     // Session start/stop/loss/retry, after this frame's XR work so a shutdown never cuts a
     // frame in half.
     xr::Service(g_dev, g_xrWanted);
@@ -1883,7 +2455,7 @@ void BeforePresent() {
         if (recorded && stallLogs < 10) Log("XR stereo pair did not complete; flat frame instead (#%d)", ++stallLogs);
         xr::FrameInput flatInput{};
         xr::FlatFrame(g_ctx, g_bb, g_eyeTex, /*showPanel=*/!recorded, &flatInput);
-        vrinput::Publish(flatInput, false, 0.f);
+        vrinput::Publish(devtools::Filter(flatInput), false, 0.f);
     }
     if (!xr::Running()) vrinput::Suspend();
     lastEnded = xr::FramesEnded();
@@ -1900,6 +2472,7 @@ void OnPresent(IDXGISwapChain* sc) {
         Hook(vt[13], reinterpret_cast<void*>(&HookResizeBuffers), reinterpret_cast<void**>(&g_origResizeBuffers),
              "IDXGISwapChain::ResizeBuffers");
     }
+    devtools::Frame();  // developer build only (devtools.h)
     // F9: VR on / off (applied at the next Present by xr::Service, like the "xr" verb).
     static hotkeys::Edge f9;
     if (f9.Feed(VK_F9)) {
@@ -1919,6 +2492,34 @@ void OnPresent(IDXGISwapChain* sc) {
 
 bool XrWanted() { return g_xrWanted.load(); }
 
+void RequestVr(bool on) {
+    g_xrWanted = on;  // applied at the next Present (xr::Service), like F9
+    Log("XR %s requested (VR settings)", on ? "on" : "off");
+}
+
+// AFR (playbook 18): RecordList records one alternating eye (the pass index and the eye are separate:
+// g_recordingPass / g_recordingLast), xr begins and ends that pair on its only eye and submits the other eye's
+// last image with the pose it was drawn for. Mono (18.7): the same single pass, always eye 0, which xr made the head
+// centre; xr shows that picture to both eyes. Saved in b2svr.ini rendering_method.
+bool AfrSupported() { return true; }
+int GetMethod() { return g_method.load(); }
+const char* MethodName(int method) {
+    return method == kNative ? "Native (both eyes every frame)"
+           : method == kMono ? "Mono (one centre picture for both eyes)"
+                             : "AFR (one eye per frame)";
+}
+void SetMethod(int method) {
+    method = method == kNative || method == kMono ? method : kAfr;
+    // The next frame's views are located for the new method (xr::SetMono); a kept eye image always carries the pose
+    // and frustum it was drawn with (a Mono image: the centre), so AFR can follow any method at once.
+    g_method = method;
+    xr::SetMono(method == kMono);
+    WritePrivateProfileStringW(L"b2svr", L"rendering_method",
+                               method == kNative ? L"native" : method == kMono ? L"mono" : L"afr",
+                               (GameDir() + L"\\b2svr.ini").c_str());
+    Log("STEREO rendering method -> %s (saved to b2svr.ini)", MethodName(method));
+}
+
 bool Command(const char* verb, const char* arg) {
     const std::string v = verb;
     if (v == "stereo") {
@@ -1934,6 +2535,9 @@ bool Command(const char* verb, const char* arg) {
     } else if (v == "xr") {
         g_xrWanted = std::strcmp(arg, "on") == 0;  // applied at the next Present (xr::Service)
         Log("XR %s requested", g_xrWanted ? "on" : "off");
+    } else if (v == "method") {
+        // "method native|afr|mono", as the VR settings (saved)
+        SetMethod(arg && std::strcmp(arg, "native") == 0 ? kNative : arg && std::strcmp(arg, "mono") == 0 ? kMono : kAfr);
     } else if (v == "recenter") {
         xr::Recenter();
     } else if (v == "lumtrace") {
@@ -2058,6 +2662,36 @@ bool Command(const char* verb, const char* arg) {
         g_passes = std::atoi(arg) == 3 ? 3 : 2;
         if (g_passes == 3) Log("STEREO WARNING: passes=3 is known to crash the render thread");
         Log("STEREO passes=%d", g_passes.load());
+    } else if (v == "skipstage") {
+        // EXP-050 discriminator: "skipstage N" skips stage N of kStageVa, "skipstage -N" runs it again (the dev command
+        // file passes one word); 3 = 0x140889c60, the environment probe update.
+        const int n = arg ? std::atoi(arg) : -100;
+        const int idx = n < 0 ? -n : n;
+        if (n != -100 && idx < kStageCount) {
+            const uint32_t bit = 1u << idx;
+            if (n < 0 || (arg && arg[0] == '-')) g_skipStages &= ~bit;
+            else g_skipStages |= bit;
+            Log("STEREO stage %d (%s) %s", idx, kStageMarker[idx], (g_skipStages.load() & bit) ? "SKIPPED" : "on");
+        }
+    } else if (v == "framebudget") {
+        g_framePerEye = std::strcmp(arg, "off") != 0;
+        Log("STEREO frame budget per eye pass (EXP-053) %s; %llu given, %llu skipped (no pass sync)",
+            g_framePerEye ? "on" : "OFF", static_cast<unsigned long long>(g_budgetResets.load()),
+            static_cast<unsigned long long>(g_budgetSkips.load()));
+    } else if (v == "texguard") {
+        texguard::SelfTest();
+    } else if (v == "visprobe") {
+        g_visProbe = std::atoi(arg) > 0 ? std::atoi(arg) : 8;
+        Log("STEREO visibility probe for %d eye passes (EXP-053)", g_visProbe.load());
+    } else if (v == "reflprobe") {
+        g_reflProbe = std::atoi(arg) > 0 ? std::atoi(arg) : 40;
+        Log("STEREO reflection probe for %d DisplayReflection stages (EXP-050)", g_reflProbe.load());
+    } else if (v == "vpsnap") {
+        g_vpSnapshot = std::strcmp(arg, "off") != 0;
+        Log("STEREO viewport snapshot refresh (EXP-049) %s", g_vpSnapshot ? "on" : "off");
+    } else if (v == "vppoison") {
+        g_vpPoison = std::strcmp(arg, "view") == 0 ? 1 : std::strcmp(arg, "proj") == 0 ? 2 : 0;
+        Log("STEREO viewport record poison (EXP-049 diagnostic) %d (0 off, 1 view, 2 projection)", g_vpPoison.load());
     } else if (v == "sshot") {
         std::lock_guard lock(g_shotMutex);
         g_shotName = arg[0] ? arg : "b2svr_eyes";

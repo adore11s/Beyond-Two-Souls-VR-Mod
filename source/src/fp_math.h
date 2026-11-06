@@ -30,6 +30,83 @@ inline Mat4 YawFrame(const Mat4& root) {
                           {root.m[12], root.m[13], root.m[14]});
 }
 
+// Drawn-hand filter (playbook 08.1, GoW SmoothHand): an adaptive one-pole filter on the controller grip
+// matrix in the recentered tracking space, before it is placed on the body. Only the DRAWN hands use it;
+// gestures and the game's input keep the raw samples. Per hand: one filtered matrix and the XR display
+// time of its sample, so a repeated poll of the same sample never invents a velocity.
+//   rot = sqrt(0.5 * sum((R - Rf)^2)), speed = (|p - pf| + 0.15 * rot) / dt,
+//   cutoff = cutoffHz + beta * speed, alpha = 1 / (1 + tau / dt) with tau = 1 / (2 pi cutoff),
+//   the 12 affine components move by alpha, then the rotation rows are made orthonormal (scale kept).
+// The first sample, dt <= 0 with a new time, dt > 0.1 s or a new recenter epoch start again from the raw grip.
+struct HandFilter {
+    bool have = false;
+    int64_t time = 0;
+    uint32_t epoch = 0;
+    Mat4 m = pose::Identity();
+    void Reset() { have = false; }
+    Mat4 Feed(const Mat4& raw, int64_t timeNs, uint32_t recenterEpoch, float cutoffHz = 3.f, float beta = 6.f) {
+        if (have && timeNs == time && recenterEpoch == epoch) return m;  // the same sample again
+        const float dt = float(double(timeNs - time) * 1e-9);
+        if (!have || recenterEpoch != epoch || !(dt > 0.f) || dt > 0.1f || !ValidMatrix(m)) {
+            m = raw;
+            time = timeNs;
+            epoch = recenterEpoch;
+            have = true;
+            return m;
+        }
+        float rot2 = 0.f;
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) {
+                const float d = raw.m[r * 4 + c] - m.m[r * 4 + c];
+                rot2 += d * d;
+            }
+        const float rot = std::sqrt(0.5f * rot2);
+        const Vec3 dp{raw.m[12] - m.m[12], raw.m[13] - m.m[13], raw.m[14] - m.m[14]};
+        const float speed = (Len(dp) + 0.15f * rot) / dt;
+        const float cutoff = cutoffHz + beta * speed;
+        const float tau = 1.f / (6.2831853f * cutoff);
+        const float alpha = 1.f / (1.f + tau / dt);
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 3; ++c) m.m[r * 4 + c] += alpha * (raw.m[r * 4 + c] - m.m[r * 4 + c]);
+        // Gram-Schmidt on the rows (X, Y; Z = X x Y), each row taking the raw sample's length (blending two
+        // rotations shortens the rows; the scale to keep is the controller's own).
+        Vec3 x{m.m[0], m.m[1], m.m[2]}, y{m.m[4], m.m[5], m.m[6]};
+        const Vec3 z0{m.m[8], m.m[9], m.m[10]};
+        const float sx = Len(Vec3{raw.m[0], raw.m[1], raw.m[2]}), sy = Len(Vec3{raw.m[4], raw.m[5], raw.m[6]}),
+                    sz = Len(Vec3{raw.m[8], raw.m[9], raw.m[10]});
+        x = Norm(x);
+        y = Norm(Sub(y, Mul(x, Dot(x, y))));
+        Vec3 z{x.y * y.z - x.z * y.y, x.z * y.x - x.x * y.z, x.x * y.y - x.y * y.x};
+        if (Dot(z, z0) < 0.f) z = Mul(z, -1.f);  // keep the handedness the samples have
+        for (int c = 0; c < 3; ++c) {
+            m.m[c] = (&x.x)[c] * sx;
+            m.m[4 + c] = (&y.x)[c] * sy;
+            m.m[8 + c] = (&z.x)[c] * sz;
+        }
+        time = timeNs;
+        return m;
+    }
+};
+
+// Headset family for the wrist angle (playbook 08.3): the OpenXR system name, lower-cased.
+// playstation / psvr / sony / vr2 -> 0 (PS VR2); quest / oculus / meta -> 1 (Meta Quest); anything else -> 2.
+inline int HeadsetFamily(const char* systemName) {
+    char s[128] = {};
+    for (int i = 0; i < 127 && systemName && systemName[i]; ++i)
+        s[i] = char(systemName[i] >= 'A' && systemName[i] <= 'Z' ? systemName[i] + 32 : systemName[i]);
+    auto has = [&](const char* w) {
+        for (const char* p = s; *p; ++p) {
+            int k = 0;
+            while (w[k] && p[k] == w[k]) ++k;
+            if (!w[k]) return true;
+        }
+        return false;
+    };
+    if (has("playstation") || has("psvr") || has("sony") || has("vr2")) return 0;
+    if (has("quest") || has("oculus") || has("meta")) return 1;
+    return 2;
+}
+
 class StableEye {
 public:
     static constexpr int kSamples=30;
@@ -57,6 +134,29 @@ public:
         Mat4 b=pose::FromPose(pose::YawQuat(viewYaw),{0,0,0}); Mat4 eye=Eye(root); Vec3 p{eye.m[12],eye.m[13],eye.m[14]}; Vec3 o=pose::TransformPoint({0,upOffset,-forwardOffset},b); b.m[12]=p.x+o.x;b.m[13]=p.y+o.y;b.m[14]=p.z+o.z; return b;
     }
 private: uintptr_t actor_=0; int count_=0; bool ready_=false; Vec3 offset_{};
+};
+
+// EXP-059: the walking eye on foot and on a horse. A rider's head sits ~0.75 m higher above her root than a standing
+// head, so one eye learned on the horse kept the view that much too high after the dismount (owner 0.24.0). The engine
+// says which applies: her motion kit synced to another character's motion graph (SyncMotionKit) = riding; each mount
+// (synced graph) learns its own eye, and the on-foot eye learned before the ride is used again once she is unsynced.
+class MountedEyes {
+public:
+    void Reset(uintptr_t actor){ foot_.Reset(actor); ride_.Reset(actor); rideGraph_=0; riding_=false; }
+    // kitRead: her motion kit could be read this frame (cutscenes have none: the last state is kept).
+    // synced: the motion graph it is synced to, 0 = not synced. Returns true when on foot / riding changed.
+    bool Update(uintptr_t actor,bool kitRead,uintptr_t synced){
+        if(!kitRead) return false;
+        const bool riding=synced!=0, changed=riding!=riding_;
+        riding_=riding;
+        if(riding && synced!=rideGraph_){ ride_.Reset(actor); rideGraph_=synced; }
+        return changed;
+    }
+    bool Riding() const{return riding_;}
+    StableEye& Active(){return riding_?ride_:foot_;}
+    const StableEye& Foot() const{return foot_;}
+    const StableEye& Ride() const{return ride_;}
+private: StableEye foot_, ride_; uintptr_t rideGraph_=0; bool riding_=false;
 };
 
 inline Vec3 Cross(Vec3 a, Vec3 b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }

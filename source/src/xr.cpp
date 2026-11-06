@@ -19,6 +19,8 @@
 
 #include "hotkeys.h"
 #include "log.h"
+#include "panel.h"
+#include "devtools.h"
 #include "posemath.h"
 #include "videowatch.h"
 #include "xr_geometry.h"
@@ -68,6 +70,13 @@ struct EyeSwapchain {
 };
 EyeSwapchain g_eyes[2];
 EyeSwapchain g_quad;  // flat UI / 2D screen panel
+EyeSwapchain g_panelSc, g_cursorSc;  // VR settings panel (panel.h) and its pointer dot
+bool g_panelFilled = false, g_cursorFilled = false;  // their images hold content (reset with the session)
+EyeSwapchain g_tpSc;          // developer tools overlay (devtools.h)
+bool g_tpFilled = false;      // its image holds content (reset with the session)
+uint64_t g_tpVersion = 0;     // devtools::Overlay::version of the uploaded image
+// The runtime's recommended eye image size (largest of the two eyes), for the Auto VR picture size.
+std::atomic<uint32_t> g_recommendedW{0}, g_recommendedH{0};
 bool g_linearizeInShader = false;
 constexpr float kQuadDistance = 1.8f, kQuadWidth = 2.2f;
 
@@ -89,8 +98,23 @@ struct Packet {
     XrPosef refPose{{0, 0, 0, 1}, {0, 0, 0}};  // seated reference these views were composed with
     uint32_t recenterEpoch = 0;
     FrameInput input;
+    int onlyEye = -1;  // AFR: the one eye this pair draws (-1 = both)
+    bool mono = false;  // Mono (18.7): both views are the head centre; eye 0's picture goes to both eyes
 };
+std::atomic<bool> g_mono{false};  // Mono for the next BeginGameFrame (stereo::SetMethod)
 Packet g_packets[kSlots];
+// AFR: what each eye's swapchain shows now (its last released image) - the pose and frustum that image was
+// drawn for, when, and in which recenter generation. Written at xrEndFrame (render thread), read by CanKeepEye
+// (game thread).
+struct KeptEye {
+    bool valid = false;
+    XrPosef pose{};
+    XrFovf fov{};
+    uint64_t tickMs = 0;
+    uint32_t epoch = 0;
+};
+std::mutex g_keptMutex;
+KeptEye g_kept[2];
 // Last views with valid, normalised orientation and position (held through tracking loss).
 XrView g_goodViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 // EXP-014: render and submit a symmetric per-eye frustum containing the runtime's asymmetric one.
@@ -734,6 +758,11 @@ char g_systemName[XR_MAX_SYSTEM_NAME_SIZE] = "";
 char g_runtimeName[XR_MAX_RUNTIME_NAME_SIZE] = "";
 
 bool Running() { return g_started && g_running; }
+bool RecommendedEyeSize(uint32_t* w, uint32_t* h) {
+    *w = g_recommendedW.load(std::memory_order_relaxed);
+    *h = g_recommendedH.load(std::memory_order_relaxed);
+    return *w > 0 && *h > 0;
+}
 const char* SystemName() { return g_systemName; }
 const char* RuntimeName() { return g_runtimeName; }
 uint64_t FramesEnded() { return g_framesEnded; }
@@ -823,14 +852,23 @@ bool Start(ID3D11Device* device) {
     Log("XR swapchain format %lld, eye size %ux%u", static_cast<long long>(format),
         vcv[0].recommendedImageRectWidth, vcv[0].recommendedImageRectHeight);
 
-    for (int e = 0; e < 3; ++e) {
-        EyeSwapchain& s = e < 2 ? g_eyes[e] : g_quad;
+    g_recommendedW = std::max(vcv[0].recommendedImageRectWidth, vcv[1].recommendedImageRectWidth);
+    g_recommendedH = std::max(vcv[0].recommendedImageRectHeight, vcv[1].recommendedImageRectHeight);
+    for (int e = 0; e < 6; ++e) {
+        if (e == 5 && !devtools::Available()) continue;  // no overlay swapchain in the release build
+        EyeSwapchain& s = e < 2 ? g_eyes[e] : e == 2 ? g_quad : e == 3 ? g_panelSc : e == 4 ? g_cursorSc : g_tpSc;
         XrSwapchainCreateInfo sc{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         sc.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         sc.format = format;
         sc.sampleCount = 1;
-        sc.width = s.width = e < 2 ? int32_t(vcv[e].recommendedImageRectWidth) : 1920;
-        sc.height = s.height = e < 2 ? int32_t(vcv[e].recommendedImageRectHeight) : 1080;
+        const int32_t sizes[6][2] = {{int32_t(vcv[0].recommendedImageRectWidth), int32_t(vcv[0].recommendedImageRectHeight)},
+                                     {int32_t(vcv[1].recommendedImageRectWidth), int32_t(vcv[1].recommendedImageRectHeight)},
+                                     {1920, 1080},
+                                     {panel::kWidthPx, panel::kHeightPx},
+                                     {panel::kCursorPx, panel::kCursorPx},
+                                     {devtools::kOverlayWidthPx, devtools::kOverlayHeightPx}};
+        sc.width = s.width = sizes[e][0];
+        sc.height = s.height = sizes[e][1];
         sc.faceCount = sc.arraySize = sc.mipCount = 1;
         if (!Check(xrCreateSwapchain(g_session, &sc, &s.handle), "xrCreateSwapchain")) return false;
         uint32_t ni = 0;
@@ -852,6 +890,11 @@ bool Start(ID3D11Device* device) {
             }
             s.rtvs.push_back(rtv);
         }
+    }
+    g_panelFilled = g_cursorFilled = g_tpFilled = false;
+    {
+        std::lock_guard lock(g_keptMutex);
+        g_kept[0] = g_kept[1] = KeptEye{};
     }
     Log("XR swapchains ready (%zu images, linearize=%d)", g_eyes[0].images.size(), int(g_linearizeInShader));
     if (!CreateBlitResources()) return false;
@@ -875,7 +918,13 @@ void Shutdown(const char* why) {
     g_frameOpen = false;
     g_beginPending = false;
     for (auto& p : g_packets) p.valid = false;
-    for (EyeSwapchain* s : {&g_eyes[0], &g_eyes[1], &g_quad}) {
+    g_panelFilled = g_cursorFilled = g_tpFilled = false;
+    panel::Hidden();
+    {
+        std::lock_guard lock(g_keptMutex);
+        g_kept[0] = g_kept[1] = KeptEye{};
+    }
+    for (EyeSwapchain* s : {&g_eyes[0], &g_eyes[1], &g_quad, &g_panelSc, &g_cursorSc, &g_tpSc}) {
         for (auto* rtv : s->rtvs)
             if (rtv) rtv->Release();
         s->rtvs.clear();
@@ -1079,6 +1128,26 @@ int BeginGameFrame(EyeView eyes[2], FrameInput* input) {
             (l.m[12]+r.m[12])*.5f, (l.m[13]+r.m[13])*.5f, (l.m[14]+r.m[14])*.5f);
     }
     for (int e = 0; e < 2; ++e) p.ownFov[e] = p.views[e].fov;
+    p.mono = g_mono.load();
+    if (p.mono) {
+        // Mono (playbook 18.7): both views become the head centre - the midpoint of the eyes with their mean
+        // orientation - and render a frustum covering both eyes' own. Each eye keeps its own frustum (ownFov): its
+        // image is cropped out of the one picture and submitted with the centre pose, never with its own position.
+        XrView c = p.views[0];
+        const XrPosef &a = p.views[0].pose, &b = p.views[1].pose;
+        c.pose.position = {0.5f * (a.position.x + b.position.x), 0.5f * (a.position.y + b.position.y),
+                           0.5f * (a.position.z + b.position.z)};
+        const float s = a.orientation.x * b.orientation.x + a.orientation.y * b.orientation.y +
+                        a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w < 0.f ? -1.f : 1.f;
+        pose::Quat q{a.orientation.x + s * b.orientation.x, a.orientation.y + s * b.orientation.y,
+                     a.orientation.z + s * b.orientation.z, a.orientation.w + s * b.orientation.w};
+        if (pose::Normalize(q)) c.pose.orientation = {q.x, q.y, q.z, q.w};
+        c.fov = {std::min(p.views[0].fov.angleLeft, p.views[1].fov.angleLeft),
+                 std::max(p.views[0].fov.angleRight, p.views[1].fov.angleRight),
+                 std::max(p.views[0].fov.angleUp, p.views[1].fov.angleUp),
+                 std::min(p.views[0].fov.angleDown, p.views[1].fov.angleDown)};
+        p.views[0] = p.views[1] = c;
+    }
     if (g_symFov) {
         // EXP-014: render a symmetric frustum that contains the eye's own. 0.17.16: the eye image is
         // cropped back to the eye's own frustum and that is what is submitted (xr_geometry.h).
@@ -1098,13 +1167,29 @@ int BeginGameFrame(EyeView eyes[2], FrameInput* input) {
         eyes[e].tanUp = std::tan(v.fov.angleUp);
         eyes[e].tanDown = std::tan(v.fov.angleDown);
     }
+    p.onlyEye = -1;
     p.valid = true;
     g_beginPending = true;
     return slot;
 }
 
+bool CanKeepEye(int eye) {
+    if (eye < 0 || eye > 1) return false;
+    std::lock_guard lock(g_keptMutex);
+    const KeptEye& k = g_kept[eye];
+    const uint64_t now = GetTickCount64();
+    return k.valid && k.epoch == g_recenterEpoch.load() && now >= k.tickMs && now - k.tickMs <= 100;
+}
+void SetSingleEye(int slot, int eye) {
+    if (slot >= 0 && slot < kSlots) g_packets[slot].onlyEye = eye == 0 || eye == 1 ? eye : -1;
+}
+int SingleEye(int slot) { return slot >= 0 && slot < kSlots ? g_packets[slot].onlyEye : -1; }
+void SetMono(bool on) { g_mono = on; }
+bool IsMono(int slot) { return slot >= 0 && slot < kSlots && g_packets[slot].mono; }
+
 void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool sceneHidden = false,
-                        const XrCompositionLayerQuad* extra = nullptr);
+                        ID3D11DeviceContext* ctx = nullptr);
+bool TeleportLayer(ID3D11DeviceContext* ctx, const XrPosef& ref, XrCompositionLayerQuad* out);
 
 namespace {
 // Diagnostic (owner 0.16.27: "in F3, going through doors the whole screen goes black for a second";
@@ -1204,7 +1289,9 @@ void OnEye(int eye, int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, ui
     if (!g_started || slot < 0 || slot >= kSlots) return;
     Packet& p = g_packets[slot];
     if (!p.valid) return;
-    if (eye == 0) {
+    if (p.onlyEye >= 0 && eye != p.onlyEye) return;  // AFR: this pair draws only the other eye
+    const bool firstEye = p.onlyEye >= 0 || eye == 0, lastEye = p.onlyEye >= 0 || eye == 1;
+    if (firstEye) {
         if (g_frameOpen) {  // a pair never finished: close it empty so begin/end stay paired
             XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
             ei.displayTime = p.displayTime;
@@ -1227,34 +1314,48 @@ void OnEye(int eye, int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, ui
     g_lastEyeTop = srcTop;
     g_lastEyeHeight = srcHeight;
     if (p.shouldRender) {
-        EyeSwapchain& s = g_eyes[eye];
-        uint32_t idx = 0;
-        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if (XR_SUCCEEDED(xrAcquireSwapchainImage(s.handle, &ai, &idx))) {
-            XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            wi.timeout = XR_INFINITE_DURATION;
-            xrWaitSwapchainImage(s.handle, &wi);
-            const xrgeom::UvRect crop = EyeCrop(p.views[eye].fov, p.ownFov[eye]);
-            Blit(ctx, src, srcTop, srcHeight, s.rtvs[idx], s.width, s.height, 0, false, g_linearizeInShader, 0.f, 0.f,
-                 &crop);
-            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            xrReleaseSwapchainImage(s.handle, &ri);
+        // Mono: the one centre picture goes into both eyes' images, each cropped to that eye's own frustum.
+        for (int e = 0; e < 2; ++e) {
+            if (e != eye && !p.mono) continue;
+            EyeSwapchain& s = g_eyes[e];
+            uint32_t idx = 0;
+            XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            if (XR_SUCCEEDED(xrAcquireSwapchainImage(s.handle, &ai, &idx))) {
+                XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wi.timeout = XR_INFINITE_DURATION;
+                xrWaitSwapchainImage(s.handle, &wi);
+                const xrgeom::UvRect crop = EyeCrop(p.views[e].fov, p.ownFov[e]);
+                Blit(ctx, src, srcTop, srcHeight, s.rtvs[idx], s.width, s.height, 0, false, g_linearizeInShader, 0.f,
+                     0.f, &crop);
+                XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(s.handle, &ri);
+            }
         }
         if (eye == 0) SampleEyeDarkness(ctx, src, srcTop, srcHeight);
     }
 
-    if (eye == 1 && !uiFollows) EndFrameWithLayers(p, nullptr);
+    if (lastEye && !uiFollows) EndFrameWithLayers(p, nullptr, false, ctx);
 }
 
 // sceneHidden: only the panel is shown (a full-screen video in the 2D layer), in black space.
-void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool sceneHidden,
-                        const XrCompositionLayerQuad* extra) {
+// ctx (render thread): also shows the developer tools overlay while it is open (developer build).
+void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool sceneHidden, ID3D11DeviceContext* ctx) {
     {
         XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                   {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        KeptEye kept[2];
+        {
+            std::lock_guard lock(g_keptMutex);
+            kept[0] = g_kept[0];
+            kept[1] = g_kept[1];
+        }
         for (int e = 0; e < 2; ++e) {
-            pv[e].pose = p.views[e].pose;
-            pv[e].fov = p.ownFov[e];  // the eye image was cropped to it (OnEye)
+            // AFR: the eye not drawn this frame keeps its swapchain's last image, so it goes out with the pose and
+            // frustum that image was drawn for (the compositor reprojects it to the head's pose now).
+            // Mono: both eyes were drawn this frame (OnEye), at the centre pose.
+            const bool keptEye = p.onlyEye >= 0 && e != p.onlyEye && !p.mono && kept[e].valid;
+            pv[e].pose = keptEye ? kept[e].pose : p.views[e].pose;
+            pv[e].fov = keptEye ? kept[e].fov : p.ownFov[e];  // the eye image was cropped to it (OnEye)
             pv[e].subImage.swapchain = g_eyes[e].handle;
             pv[e].subImage.imageRect = {{0, 0}, {g_eyes[e].width, g_eyes[e].height}};
         }
@@ -1262,21 +1363,30 @@ void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool scen
         layer.space = g_local;
         layer.viewCount = 2;
         layer.views = pv;
-        const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer),
-                                                        reinterpret_cast<const XrCompositionLayerBaseHeader*>(quad),
-                                                        reinterpret_cast<const XrCompositionLayerBaseHeader*>(extra)};
+        // panelOnly: a full-screen video alone on its quad, in black space (no scene layer).
         const bool panelOnly = sceneHidden && quad;
+        XrCompositionLayerQuad tp;
+        const bool haveTp = ctx && p.shouldRender && TeleportLayer(ctx, p.refPose, &tp);
+        const XrCompositionLayerBaseHeader* layers[3] = {};
+        uint32_t count = 0;
+        if (!panelOnly) layers[count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
+        if (quad) layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(quad);
+        if (haveTp) layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&tp);
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = p.displayTime;
         ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        ei.layerCount = p.shouldRender ? (panelOnly ? 1 : quad ? (extra ? 3 : 2) : 1) : 0;
-        ei.layers = panelOnly ? layers + 1 : layers;
+        ei.layerCount = p.shouldRender ? count : 0;
+        ei.layers = layers;
         const XrResult r = xrEndFrame(g_session, &ei);
         if (p.shouldRender) {
+            const uint64_t now = GetTickCount64();
+            std::lock_guard lock(g_keptMutex);
             for (int e = 0; e < 2; ++e) {
+                if (p.onlyEye >= 0 && e != p.onlyEye && !p.mono) continue;  // its image and pose stay as they were
                 g_lastCrop[e] = EyeCrop(p.views[e].fov, p.ownFov[e]);
                 g_lastViews[e] = p.views[e];
                 g_lastViews[e].fov = p.ownFov[e];
+                if (XR_SUCCEEDED(r)) g_kept[e] = {true, p.views[e].pose, p.ownFov[e], now, p.recenterEpoch};
             }
             g_haveLastViews = true;
         }
@@ -1554,7 +1664,111 @@ void OnUiEnd(int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID
             uiFrames, int(haveQuad), int(p.shouldRender), int(video), quad.pose.position.x, quad.pose.position.y,
             quad.pose.position.z, quad.pose.orientation.x, quad.pose.orientation.y, quad.pose.orientation.z,
             quad.pose.orientation.w, quad.size.width, quad.size.height);
-    EndFrameWithLayers(p, haveQuad ? &quad : nullptr, video && haveQuad);
+    EndFrameWithLayers(p, haveQuad ? &quad : nullptr, video && haveQuad, ctx);
+}
+
+// ---- VR settings panel (panel.h) ----
+ID3D11Texture2D* g_panelTex = nullptr;  // GDI pixels (B8G8R8A8), blitted into the panel swapchain
+ID3D11Texture2D* g_cursorTex = nullptr;
+
+bool UploadQuadImage(ID3D11DeviceContext* ctx, EyeSwapchain& sc, ID3D11Texture2D*& tex, const uint32_t* pixels, int w,
+                     int h, int alphaMode) {
+    if (!sc.handle || sc.rtvs.empty()) return false;
+    if (!tex) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = UINT(w);
+        d.Height = UINT(h);
+        d.MipLevels = d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc = {1, 0};
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_device->CreateTexture2D(&d, nullptr, &tex))) return false;
+    }
+    ctx->UpdateSubresource(tex, 0, nullptr, pixels, UINT(w) * 4, 0);
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!XR_SUCCEEDED(xrAcquireSwapchainImage(sc.handle, &ai, &idx))) return false;
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(sc.handle, &wi);
+    Blit(ctx, tex, 0, UINT(h), sc.rtvs[idx], sc.width, sc.height, alphaMode, false, g_linearizeInShader);
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(sc.handle, &ri);
+    return true;
+}
+
+// A point and yaw of the seated reference frame -> LOCAL (the reference is yaw-only, as in MakeQuad).
+XrPosef RefToLocal(const XrPosef& ref, const pose::Vec3& p, float yaw) {
+    const float ry = 2.f * std::atan2(ref.orientation.y, ref.orientation.w);
+    const float c = std::cos(ry), s = std::sin(ry), t = ry + yaw;
+    XrPosef out{};
+    out.orientation = {0.f, std::sin(0.5f * t), 0.f, std::cos(0.5f * t)};
+    out.position = {ref.position.x + p.x * c + p.z * s, ref.position.y + p.y, ref.position.z - p.x * s + p.z * c};
+    return out;
+}
+
+// The panel quad and, while a controller points at it, the pointer dot, to the right of the flat screen
+// (MakeQuad: kQuadDistance ahead of the reference, kQuadWidth wide).
+// ---- developer tools overlay (devtools.h): an opaque quad where the head looked when it opened ----
+ID3D11Texture2D* g_tpTex = nullptr;
+uint32_t g_tpPixels[devtools::kOverlayWidthPx * devtools::kOverlayHeightPx];
+
+bool TeleportLayer(ID3D11DeviceContext* ctx, const XrPosef& ref, XrCompositionLayerQuad* out) {
+    devtools::Overlay ov;
+    if (!g_tpSc.handle || !devtools::GetOverlay(&ov)) return false;
+    if (!g_tpFilled || ov.version != g_tpVersion) {
+        const uint64_t v = devtools::CopyPixels(g_tpPixels);
+        if (UploadQuadImage(ctx, g_tpSc, g_tpTex, g_tpPixels, devtools::kOverlayWidthPx, devtools::kOverlayHeightPx, 0)) {
+            g_tpFilled = true;
+            g_tpVersion = v;
+        }
+    }
+    if (!g_tpFilled) return false;
+    *out = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    out->layerFlags = 0;  // opaque
+    out->space = g_local;
+    out->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    out->subImage.swapchain = g_tpSc.handle;
+    out->subImage.imageRect = {{0, 0}, {g_tpSc.width, g_tpSc.height}};
+    out->pose = RefToLocal(ref, ov.center, ov.yaw);
+    out->size = {devtools::kOverlayWidthM, devtools::kOverlayHeightM};
+    return true;
+}
+
+int PanelLayers(ID3D11DeviceContext* ctx, const FrameInput& in, const XrPosef& ref, XrCompositionLayerQuad out[2]) {
+    if (!g_panelSc.handle) return 0;
+    panel::Frame f;
+    panel::Update(in, {0.f, 0.f, -kQuadDistance}, kQuadWidth, &f);
+    if ((f.dirty || !g_panelFilled) &&
+        UploadQuadImage(ctx, g_panelSc, g_panelTex, f.pixels, panel::kWidthPx, panel::kHeightPx, 0))
+        g_panelFilled = true;
+    if (!g_panelFilled) return 0;
+    int n = 0;
+    XrCompositionLayerQuad& q = out[n++];
+    q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    q.layerFlags = 0;  // opaque
+    q.space = g_local;
+    q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    q.subImage.swapchain = g_panelSc.handle;
+    q.subImage.imageRect = {{0, 0}, {g_panelSc.width, g_panelSc.height}};
+    q.pose = RefToLocal(ref, f.placement.center, f.placement.yaw);
+    q.size = {panel::kWidthM, panel::kHeightM};
+    if (f.cursor) {
+        if (!g_cursorFilled && UploadQuadImage(ctx, g_cursorSc, g_cursorTex, panel::CursorPixels(), panel::kCursorPx,
+                                               panel::kCursorPx, 1))
+            g_cursorFilled = true;
+        if (g_cursorFilled) {
+            XrCompositionLayerQuad& c = out[n++];
+            c = q;
+            c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied
+            c.subImage.swapchain = g_cursorSc.handle;
+            c.subImage.imageRect = {{0, 0}, {g_cursorSc.width, g_cursorSc.height}};
+            c.pose = RefToLocal(ref, f.cursorAt, f.placement.yaw);
+            c.size = {f.cursorSize, f.cursorSize};
+        }
+    }
+    return n;
 }
 
 bool FlatFrame(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID3D11Texture2D* const lastEyes[2],
@@ -1596,7 +1810,7 @@ bool FlatFrame(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID3D11Text
         Log("XR flatshot: band top=%u h=%u haveViews=%d shouldRender=%d", g_lastEyeTop, g_lastEyeHeight,
             int(g_haveLastViews), int(g_lastWaitShouldRender));
     }
-    const XrCompositionLayerBaseHeader* layers[2] = {};
+    const XrCompositionLayerBaseHeader* layers[5] = {};
     uint32_t layerCount = 0;
     // A stalled stereo pair re-shows the last pair with the poses it was rendered for (world-
     // locked). 2D-only screens (intro, videos, pause menu) get no backdrop: the flat screen
@@ -1643,16 +1857,34 @@ bool FlatFrame(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID3D11Text
             xrWaitSwapchainImage(g_quad.handle, &wi);
             D3D11_TEXTURE2D_DESC d{};
             flatSrc->GetDesc(&d);
+            // 0.22.0 (owner: "remove white border around 2d stuff floating"): no frame around the flat screen.
             Blit(ctx, flatSrc, 0, d.Height, g_quad.rtvs[idx], g_quad.width, g_quad.height, 0, false,
-                 g_linearizeInShader, 0.f, 0.004f);
+                 g_linearizeInShader, 0.f, 0.f);
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             xrReleaseSwapchainImage(g_quad.handle, &ri);
             haveQuad = true;
         }
-        // The whole flat frame, opaque; the grey border keeps its edges visible on dark screens.
+        // The whole flat frame, opaque, without a border.
         quad.layerFlags = 0;
         if (haveQuad) layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
     }
+    // The VR settings panel beside the flat screen on the game's 2D-only screens (the pause menu; the main menu is a
+    // 3D scene, LIVE 0.18.0;
+    // STATIC: Beyond's pause is script-driven - ENGINE_iPauseMenu is a script variable, the PauseGame binding
+    // 140d6f1a0 pauses a script object - so a frame without a recorded VIEWPORT_LIST::Display is the signal),
+    // never over a video (Bink decoding).
+    XrCompositionLayerQuad panelLayers[2];
+    int panels = 0;
+    const uint64_t nowMs = GetTickCount64();
+    if (haveQuad && input && FrameInputUsable(*input, nowMs) && !videowatch::Playing(nowMs))
+        panels = PanelLayers(ctx, *input, refPose, panelLayers);
+    else
+        panel::Hidden();
+    for (int i = 0; i < panels; ++i)
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panelLayers[i]);
+    XrCompositionLayerQuad tpLayer;
+    if (g_lastWaitShouldRender && TeleportLayer(ctx, refPose, &tpLayer))
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&tpLayer);
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_lastWaitTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;

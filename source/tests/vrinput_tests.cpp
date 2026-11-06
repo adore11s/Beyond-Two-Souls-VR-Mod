@@ -77,6 +77,44 @@ int main() {
     CHECK(!SampleFromFrame(frame, 300).focused);
     Sample nanYaw = axes; nanYaw.headYaw = NAN;
     CHECK(Map(nanYaw, true).moveX == 0.f && Map(nanYaw, true).moveY == 0.f);
+    // Settings chord (playbook 28.1): no face button reaches the game from the first press of the four until all
+    // are up; Start for 150 ms after the release; pressing them one after another never leaks a single press.
+    {
+        FaceChord chord;
+        Sample s{}; s.focused = s.fresh = true;
+        s.leftA = s.leftB = s.rightA = s.rightB = true;
+        CHECK(!chord.Feed(s, 1000) && !s.leftA && !s.rightB);
+        Sample s2{}; s2.focused = s2.fresh = true; s2.rightB = true;  // three released, one still held
+        CHECK(!chord.Feed(s2, 1100) && !s2.rightB);
+        Sample s3{}; s3.focused = s3.fresh = true;  // all up: Start
+        CHECK(chord.Feed(s3, 1200));
+        Sample s4{}; s4.focused = s4.fresh = true;
+        CHECK(chord.Feed(s4, 1349) && !chord.Feed(s4, 1350));
+        Sample single{}; single.focused = single.fresh = true; single.rightA = true;  // a lone A still reaches the game
+        CHECK(!chord.Feed(single, 2000) && single.rightA);
+    }
+    // Head switch (playbook 28.2): right hand at the face + B switches once and B never reaches the game while
+    // held; B with the hand at the chest or over the shoulder still reaches the game.
+    {
+        Mat4 head = Identity();
+        head.m[13] = 1.6f;
+        Mat4 grip = Identity();
+        grip.m[12] = 0.08f; grip.m[13] = 1.6f; grip.m[14] = -0.05f;  // beside the face, a little in front
+        CHECK(HandAtHead(head, grip));
+        Mat4 chest = grip; chest.m[13] = 1.25f;
+        CHECK(!HandAtHead(head, chest));
+        Mat4 shoulder = grip; shoulder.m[14] = 0.2f;  // behind the face plane: the over-the-shoulder zone
+        CHECK(!HandAtHead(head, shoulder));
+        HeadSwitch sw;
+        Sample b{}; b.focused = b.fresh = true; b.rightB = true;
+        CHECK(sw.Feed(b, true) && !b.rightB);
+        Sample held = {}; held.focused = held.fresh = true; held.rightB = true;
+        CHECK(!sw.Feed(held, true) && !held.rightB);  // one switch per press, still consumed
+        Sample up{}; up.focused = up.fresh = true;
+        CHECK(!sw.Feed(up, true));
+        Sample away{}; away.focused = away.fresh = true; away.rightB = true;
+        CHECK(!sw.Feed(away, false) && away.rightB);
+    }
     std::printf("VRINPUT CHECKS: %d passed, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

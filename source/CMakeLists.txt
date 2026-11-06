@@ -8,7 +8,8 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 find_package(minhook CONFIG REQUIRED)
 find_package(OpenXR CONFIG REQUIRED)
 
-add_library(b2svr SHARED
+# Everything but the developer tools, shared by both DLLs.
+add_library(b2svr_common OBJECT
     src/dllmain.cpp
     src/log.cpp
     src/crashreport.cpp
@@ -32,18 +33,34 @@ add_library(b2svr SHARED
     src/prompts.cpp
     src/videowatch.cpp
     src/zonefix.cpp
+    src/panel.cpp
+    src/audio.cpp
+    src/texguard.cpp
+    src/ctrlprobe.cpp
+    src/storyvars.cpp
     src/count_thunks.asm
     src/trace_thunk.asm
-    src/dinput8.def
 )
+target_compile_definitions(b2svr_common PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(b2svr_common PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zi>)
+target_include_directories(b2svr_common PUBLIC src)
+target_link_libraries(b2svr_common PUBLIC minhook::minhook OpenXR::headers OpenXR::openxr_loader
+    d3d11 dxgi bcrypt d3dcompiler gdi32)
+
+# The mod players get (the release, ../B2S_VR_MOD): no developer tools (src/devtools_off.cpp, devtools.h).
+add_library(b2svr SHARED src/devtools_off.cpp src/dinput8.def)
+target_link_libraries(b2svr PRIVATE b2svr_common)
 set_target_properties(b2svr PROPERTIES OUTPUT_NAME "dinput8")
-target_compile_definitions(b2svr PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(b2svr PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zi>)
 # /PDBALTPATH: the DLL names its symbols file "dinput8.pdb" instead of the build machine's full
 # path (which would carry the builder's Windows user name into every released DLL).
 target_link_options(b2svr PRIVATE /DEBUG /OPT:REF /PDBALTPATH:dinput8.pdb)
-target_link_libraries(b2svr PRIVATE minhook::minhook OpenXR::headers OpenXR::openxr_loader
-    d3d11 dxgi bcrypt d3dcompiler)
+
+# The maintainer's own developer build (target b2svr_dev), only where its folder exists: not in the public source.
+set(_b2s_has_devtools OFF)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/devtools/devtools.cmake")
+    set(_b2s_has_devtools ON)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/src/devtools/devtools.cmake")
+endif()
 
 # `cmake --build build --target deploy` copies the proxy into the game directory. The default
 # finds the game next to this project (dev workspace) or two levels up (the release folder's
@@ -62,18 +79,24 @@ if(B2S_GAME_DIR)
 endif()
 
 # Dev workspace only (game folder + ../B2S_VR_MOD + tools/publish.ps1; the release's source/ copy
-# has no tools/): after every build the new DLL goes into the game folder AND the release folder,
-# so the build being played and the build players download are always the same file.
+# has no tools/): after every build the new DLLs go into the game folder (developer build) AND the
+# release folder (release build): the same mod, the release without the developer tools.
 # -DB2SVR_PUBLISH=OFF turns it off.
 set(_b2s_release_dir "${CMAKE_CURRENT_SOURCE_DIR}/../B2S_VR_MOD")
 if(B2S_GAME_DIR AND EXISTS "${_b2s_release_dir}" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/publish.ps1")
     option(B2SVR_PUBLISH "After each build, install the DLL into the game and refresh ../B2S_VR_MOD" ON)
     if(B2SVR_PUBLISH)
-        add_custom_command(TARGET b2svr POST_BUILD
+        # The game folder gets the developer build, B2S_VR_MOD the release build (no developer tools).
+        if(_b2s_has_devtools)
+            set(_b2s_publish_target b2svr_dev)
+        else()
+            set(_b2s_publish_target b2svr)
+        endif()
+        add_custom_command(TARGET ${_b2s_publish_target} POST_BUILD
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                     -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/publish.ps1"
-                    -Dll "$<TARGET_FILE:b2svr>" -Config "$<CONFIG>" -GameDir "${B2S_GAME_DIR}"
-            COMMENT "Publishing dinput8.dll to the game folder and B2S_VR_MOD"
+                    -Dll "$<TARGET_FILE:${_b2s_publish_target}>" -Config "$<CONFIG>" -GameDir "${B2S_GAME_DIR}"
+            COMMENT "Publishing: developer dinput8.dll to the game folder, release dinput8.dll to B2S_VR_MOD"
             VERBATIM)
     endif()
 endif()
@@ -107,10 +130,32 @@ add_executable(fpbody_tests tests/fpbody_tests.cpp)
 target_compile_options(fpbody_tests PRIVATE /W4 /permissive-)
 add_test(NAME fpbody_tests COMMAND fpbody_tests)
 
+# EXP-056: the game's rig convention (src/rigmap.h).
+add_executable(rigmap_tests tests/rigmap_tests.cpp)
+target_compile_options(rigmap_tests PRIVATE /W4 /permissive-)
+add_test(NAME rigmap_tests COMMAND rigmap_tests)
+
 add_executable(vrinput_tests tests/vrinput_tests.cpp)
 target_include_directories(vrinput_tests PRIVATE src)
 target_compile_options(vrinput_tests PRIVATE /W4 /permissive-)
 add_test(NAME vrinput_tests COMMAND vrinput_tests)
+
+# Head-tracked sound listener (src/audio_math.h).
+add_executable(audio_tests tests/audio_tests.cpp)
+target_include_directories(audio_tests PRIVATE src)
+target_compile_options(audio_tests PRIVATE /W4 /permissive-)
+add_test(NAME audio_tests COMMAND audio_tests)
+
+# VR settings panel geometry, trigger and steppers (src/panel_math.h, playbook chapter 2).
+add_executable(panel_tests tests/panel_tests.cpp)
+target_include_directories(panel_tests PRIVATE src)
+target_compile_options(panel_tests PRIVATE /W4 /permissive-)
+add_test(NAME panel_tests COMMAND panel_tests)
+# Not a test: renders the panel to panel_preview.bmp for a visual check (game side stubbed).
+add_executable(panel_preview tests/panel_preview.cpp src/panel.cpp)
+target_include_directories(panel_preview PRIVATE src)
+target_compile_definitions(panel_preview PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_link_libraries(panel_preview PRIVATE gdi32)
 
 add_executable(steam_shadow_tests tests/steam_shadow_tests.cpp)
 target_compile_options(steam_shadow_tests PRIVATE /W4 /permissive-)

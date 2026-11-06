@@ -20,12 +20,15 @@
 #include "watchpoint.h"
 #include "fpmode.h"
 #include "fp_math.h"
+#include "bodykind.h"
 #include "fpbody.h"
 #include "prompts.h"
 #include "vrinput.h"
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <string>
+#include <cwchar>
 
 namespace b2s::fpcam {
 namespace {
@@ -37,7 +40,13 @@ std::recursive_mutex g_stateMutex;
 bool g_f1 = false, g_f3 = false, g_arms = true;
 bool g_f3NeedsCalibration = true;  // F3 head -> view calibration must be redone (see Prepare)
 hotkeys::Edge g_f1Key, g_f3Key;
-fp::StableEye g_eye;
+// EXP-059 (owner 0.24.0, 2003 Navajo Day 2: "when I got off the horse the view stayed ~1 m too high"). LIVE: from the
+// dismount on the view sat 0.70-0.85 m above her drawn head (FPDIAG headDy, 2366-2412 s, through 7 F1 toggles), on the
+// horse at it (-0.20..+0.09). The one per-body eye had been relearned on the horse (a > 3 m base jump at 2280-2283 s,
+// then the 2.5 s "take what there is" fallback: a rider's head is out of the standing range above her root) and
+// nothing relearned it on foot. Now a second eye is learned while her motion kit is synced to another character's
+// (player::State::synced, the engine's SyncMotionKit state), and the on-foot eye is kept for when she gets off.
+fp::MountedEyes g_eyes;
 void* g_actorNode = nullptr;
 void* g_actorSkeleton = nullptr;
 void* g_cameraNode = nullptr;
@@ -48,6 +57,18 @@ bool g_baseValid = false;
 // 6 cm / 0 and put the view at the base of the skull). b2svr.ini fp_eye_fwd / fp_eye_up.
 float g_viewYaw = 0.f, g_eyeForward = 0.09f, g_eyeUp = 0.07f;
 float g_wristPitch = 0.f;  // radians; b2svr.ini fp_wrist_pitch (degrees)
+// Per headset family (playbook 08.3, fp::HeadsetFamily of the OpenXR system name): b2svr.ini wristpitch_psvr2,
+// wristpitch_quest, wristpitch_other (degrees); each falls back to fp_wrist_pitch, which was tuned on PS VR2.
+// B2S's grip basis is not GoW's, so GoW's 25 / 25 / 5 degrees do not carry over: the defaults stay 0 until a
+// headset calibration per family.
+float g_wristPitchFamily[3] = {0.f, 0.f, 0.f};  // radians
+int g_family = -1;  // the family last used (logged when it changes)
+// Drawn-hand smoothing (playbook 08.1) in F1 with motion controls: b2svr.ini hand_smoothing (on; the VR settings
+// panel's "Hand smoothing" row, read live), hand_smooth_cutoff (3 Hz), hand_smooth_beta (6). Gestures, the panel
+// pointer and the game's input keep the raw controller samples (the pointer has its own filter).
+bool g_handSmoothing = true;
+float g_handCutoff = 3.f, g_handBeta = 6.f;
+fp::HandFilter g_handFilter[2];
 // F1 right-stick turning: smooth (default) or snap steps. b2svr.ini turn=smooth|snap and
 // snap_turn_degrees (the launcher asks); dev verb "turn smooth|snap [degrees]".
 // The headset eye in the world (Jodie's eye base + your head), for the room the eye is in (zonefix).
@@ -55,6 +76,8 @@ float g_eyeWorld[3] = {};
 bool g_eyeWorldValid = false;
 bool g_snapTurn = false;
 float g_snapStep = 0.78539816f;  // radians (45 deg)
+// Smooth turning speed (VR settings panel "Turning speed", GoW presets 20 .. 100 %): a fraction of 120 deg/s.
+float g_turnSpeed = 1.f;
 fp::SnapTurn g_snap;
 uint64_t g_lastFrame = 0, g_lastAnchor = 0;
 int g_implausibleEyeFrames = 0;
@@ -65,6 +88,27 @@ bool GameForeground() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     return pid == GetCurrentProcessId();
+}
+
+std::wstring IniPath() {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring s = path;
+    return s.substr(0, s.find_last_of(L"\\/") + 1) + L"b2svr.ini";
+}
+// A first-person choice changed in the game (keys, the head switch, the VR settings panel): kept in b2svr.ini.
+void Save(const wchar_t* key, const wchar_t* value) { WritePrivateProfileStringW(L"b2svr", key, value, IniPath().c_str()); }
+
+void SetF1(bool on, const char* why) {
+    g_f1 = on;
+    Save(L"firstperson", on ? L"on" : L"off");
+    Log("FP F1=%d (%s)", int(on), why);
+}
+void SetF3(bool on, const char* why) {
+    g_f3 = on;
+    g_f3NeedsCalibration = true;
+    Save(L"fpcutscenes", on ? L"on" : L"off");
+    Log("FP F3=%d (%s)", int(on), why);
 }
 
 void* SkeletonOf(void* node) {
@@ -95,10 +139,27 @@ void ReadSettings() {
     g_eyeForward = number(L"fp_eye_fwd", g_eyeForward, -0.3f, 0.4f);
     g_eyeUp = number(L"fp_eye_up", g_eyeUp, -0.3f, 0.4f);
     g_wristPitch = number(L"fp_wrist_pitch", 0.f, -90.f, 90.f) * 0.017453293f;
+    const wchar_t* familyKeys[3] = {L"wristpitch_psvr2", L"wristpitch_quest", L"wristpitch_other"};
+    for (int f = 0; f < 3; ++f)
+        g_wristPitchFamily[f] = number(familyKeys[f], g_wristPitch * 57.29578f, -90.f, 90.f) * 0.017453293f;
+    // 0.23.0 (owner: "dont hide head in first person ... i want to see mirror reflections"): show. 0.24.0 (owner: "make
+    // the head (teeth, hair, head) hide in first person cutscenes, but keep it ... in first person gameplay"): cutscene =
+    // hidden in F3 only, the default.
+    GetPrivateProfileStringW(L"b2svr", L"fp_head", L"cutscene", value, 32, path);
+    fpbody::SetHeadMode(_wcsicmp(value, L"show") == 0 ? fpbody::kHeadShown
+                        : _wcsicmp(value, L"hide") == 0 ? fpbody::kHeadHidden
+                                                        : fpbody::kHeadHiddenInCutscenes);
+    Log("FP head in first person: %s (b2svr.ini fp_head)", fpbody::HeadModeName(fpbody::GetHeadMode()));
+    GetPrivateProfileStringW(L"b2svr", L"hand_smoothing", L"on", value, 32, path);
+    g_handSmoothing = !(_wcsicmp(value, L"off") == 0 || _wcsicmp(value, L"0") == 0);
+    g_handCutoff = number(L"hand_smooth_cutoff", 3.f, 0.1f, 30.f);
+    g_handBeta = number(L"hand_smooth_beta", 6.f, 0.f, 100.f);
     GetPrivateProfileStringW(L"b2svr", L"turn", L"smooth", value, 32, path);
     g_snapTurn = _wcsicmp(value, L"snap") == 0;
     g_snapStep = number(L"snap_turn_degrees", 45.f, 10.f, 90.f) * 0.017453293f;
-    Log("FP turning in F1: %s", g_snapTurn ? "snap" : "smooth");
+    g_turnSpeed = number(L"turn_speed", 1.f, 0.1f, 1.f);
+    Log("FP turning in F1: %s (speed %.0f %%, snap %.0f deg)", g_snapTurn ? "snap" : "smooth", g_turnSpeed * 100.f,
+        g_snapStep * 57.29578f);
 }
 
 // ---- EXP-031 discovery: which gameplay controller updates run (walking vs cutscene vs Aiden) ----
@@ -318,29 +379,45 @@ void Install() {
     g_ready = bonesOk && dirOk;
     fpbody::Install();
     prompts::Install();
+    player::Install();  // EXP-047: the possession-controller hook (possessions)
     ReadSettings();
     vrinput::Install();
     Log("FPCAM install: bones=%d director=%d eye fwd=%.3f up=%.3f wrist pitch=%.1f", int(bonesOk), int(dirOk),
         g_eyeForward, g_eyeUp, g_wristPitch * 57.29578f);
 }
 
+
 void Frame() {
     std::lock_guard lock(g_stateMutex);
-    if (g_f1Key.Feed(VK_F1)) {
-        g_f1 = !g_f1;
-        Log("FP F1=%d", int(g_f1));
-    }
-    if (g_f3Key.Feed(VK_F3)) {
-        g_f3 = !g_f3;
-        g_f3NeedsCalibration = true;
-        Log("FP F3=%d", int(g_f3));
-    }
+    if (g_f1Key.Feed(VK_F1)) SetF1(!g_f1, "F1 key");
+    if (g_f3Key.Feed(VK_F3)) SetF3(!g_f3, "F3 key");
     // F10 / F11 (owner): Xbox / PlayStation controller type for the VR controllers' virtual pad.
     static hotkeys::Edge f10, f11;
     if (f10.Feed(VK_F10)) vrinput::SetPadType(2);
     if (f11.Feed(VK_F11)) vrinput::SetPadType(5);
     if (!g_ready) return;
     const player::State st = player::Poll();
+    // Right hand at the head + B / O (GoW D-252, playbook 28.2; vrinput HeadSwitch): while the player walks as
+    // Jodie it switches F1, otherwise (a cutscene, a scripted scene) F3. Polled here, before any first-person code,
+    // so it also turns first person ON from both modes off. It replaces the both-thumbsticks combo.
+    // EXP-047 (owner: "when you press O it will switch off the first person Aiden possessions, like it does with
+    // first person gameplay and cutscenes"): while Aiden possesses someone it switches "Aiden possessions (first
+    // person)"; shown (option on, F1 on) -> off, otherwise on (with F1, which the possession view needs).
+    if (vrinput::ConsumeHeadSwitch()) {
+        if (st.menu) {
+            // The main menu has no first person: the press would only change F1 / F3 unseen (LIVE 0.19.1: F3 on / off
+            // twice at the main menu).
+            Log("FP right hand at the head + B / O at the main menu: no first person there, F1 / F3 unchanged");
+        } else if (st.possessing) {
+            const bool show = !(player::PossessionFirstPerson() && g_f1);
+            player::SetPossessionFirstPerson(show);
+            if (show && !g_f1) SetF1(true, "right hand at the head + B / O, possession");
+        } else if (st.control == player::Control::Walking) {
+            SetF1(!g_f1, "right hand at the head + B / O, walking");
+        } else {
+            SetF3(!g_f3, "right hand at the head + B / O, cutscene");
+        }
+    }
     const int n = g_probeFrames.load();
     if (n > 0) {
         if (n % 90 == 0) {
@@ -364,6 +441,55 @@ bool EyeWorld(float out[3]) {
     return true;
 }
 
+
+bool GameplayFP() { std::lock_guard lock(g_stateMutex); return g_f1; }
+bool CutsceneFP() { std::lock_guard lock(g_stateMutex); return g_f3; }
+void SetGameplayFP(bool on) { std::lock_guard lock(g_stateMutex); if (g_f1 != on) SetF1(on, "VR settings"); }
+void SetCutsceneFP(bool on) { std::lock_guard lock(g_stateMutex); if (g_f3 != on) SetF3(on, "VR settings"); }
+bool MotionControls() { std::lock_guard lock(g_stateMutex); return g_arms; }
+void SetMotionControls(bool on) {
+    std::lock_guard lock(g_stateMutex);
+    if (g_arms == on) return;
+    g_arms = on;
+    Save(L"fparms", on ? L"on" : L"off");
+    Log("FP motion controls (VR controllers move Jodie's arms) %s", on ? "on" : "off");
+}
+bool HandSmoothing() { std::lock_guard lock(g_stateMutex); return g_handSmoothing; }
+void SetHandSmoothing(bool on) {
+    std::lock_guard lock(g_stateMutex);
+    if (g_handSmoothing == on) return;
+    g_handSmoothing = on;
+    Save(L"hand_smoothing", on ? L"on" : L"off");
+    Log("FP hand smoothing (Jodie's hands with motion controls) %s", on ? "on" : "off");
+}
+bool PossessionFP() { return player::PossessionFirstPerson(); }
+void SetPossessionFP(bool on) { player::SetPossessionFirstPerson(on); }
+bool SnapTurn() { std::lock_guard lock(g_stateMutex); return g_snapTurn; }
+void SetSnapTurn(bool on) {
+    std::lock_guard lock(g_stateMutex);
+    g_snapTurn = on;
+    g_snap = {};
+    Save(L"turn", on ? L"snap" : L"smooth");
+    Log("FP turning in F1: %s", on ? "snap" : "smooth");
+}
+float SnapDegrees() { std::lock_guard lock(g_stateMutex); return g_snapStep * 57.29578f; }
+void SetSnapDegrees(float degrees) {
+    std::lock_guard lock(g_stateMutex);
+    g_snapStep = std::clamp(degrees, 10.f, 90.f) * 0.017453293f;
+    wchar_t v[16];
+    swprintf_s(v, L"%.0f", g_snapStep * 57.29578f);
+    Save(L"snap_turn_degrees", v);
+    Log("FP snap angle %.0f deg", g_snapStep * 57.29578f);
+}
+float TurnSpeed() { std::lock_guard lock(g_stateMutex); return g_turnSpeed; }
+void SetTurnSpeed(float fraction) {
+    std::lock_guard lock(g_stateMutex);
+    g_turnSpeed = std::clamp(fraction, 0.1f, 1.f);
+    wchar_t v[16];
+    swprintf_s(v, L"%.2f", g_turnSpeed);
+    Save(L"turn_speed", v);
+    Log("FP turning speed %.0f %%", g_turnSpeed * 100.f);
+}
 
 void Suspend() {
     std::lock_guard lock(g_stateMutex);
@@ -421,24 +547,10 @@ void CalibrateHeadToViewPitched(const pose::Mat4& head, float lookYaw, float pit
     g_headToViewValid = true;
 }
 
-// Both thumbsticks (owner, 2026-10-06): click and release = F1, hold 0.8 s = F3.
-void ThumbstickSwitches(const xr::FrameInput& input, uint64_t now) {
-    static bool was = false, held = false;
-    static uint64_t since = 0;
-    const bool both = input.hand[0].active && input.hand[1].active && input.hand[0].stickClick && input.hand[1].stickClick;
-    if (both && !was) { since = now; held = false; }
-    if (both && !held && now - since >= 800) {
-        held = true;
-        g_f3 = !g_f3;
-        g_f3NeedsCalibration = true;
-        Log("FP F3=%d (both thumbsticks held)", int(g_f3));
-    }
-    if (!both && was && !held) {
-        g_f1 = !g_f1;
-        Log("FP F1=%d (both thumbsticks clicked)", int(g_f1));
-    }
-    was = both;
-}
+// EXP-054's guided-walk rule (stick + head movement, off since 0.21.7) and 0.16.20's interaction rule (her head
+// 12 cm from standing within 8 s of a prompt) are gone (EXP-057, 0.23.0): the owner's marked run (2001 Navajo) had both
+// walks after a prompt and the misplaced F3 explained by the engine's own state, which player::Poll now reads (an
+// authored base-layer animation in her animation player, her physics controller, her motion kit).
 
 void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::FrameInput& input) {
     std::lock_guard lock(g_stateMutex);
@@ -454,56 +566,29 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
         if (!(g_baseValid && cameraNode == g_cameraNode && g_lastMode == fp::Mode::FirstPerson)) Suspend();
         return;
     }
-    ThumbstickSwitches(input, now);
     const player::State st = player::Poll();
     fp::BehaviourClass kind = fp::BehaviourClass::Unknown;
-    if (st.control == player::Control::Walking) kind = fp::BehaviourClass::Gameplay;
+    // The main menu (owner: "it doesn't switch to first person during that, even with first person on"): the game
+    // camera, whatever F1 / F3 say (player::State::menu).
+    if (st.menu) kind = fp::BehaviourClass::Unknown;
+    else if (st.control == player::Control::Walking) kind = fp::BehaviourClass::Gameplay;
     else if (st.control == player::Control::Cutscene) kind = fp::BehaviourClass::Cutscene;
-    // Owner 0.16.20: "make the animations after a white-dot interaction F3". LIVE: after the doll's
-    // white dots the interaction animation ran 2.5 s in the walking state (F1) before the game called it
-    // a cutscene; F1 keeps the camera at her standing eye, so as she bent over the toys the view left her
-    // head and showed her hair. Within 8 s of a prompt, with the movement stick released, a head more
-    // than 12 cm from where she stood is the game's animation: F3 rules (view on her head, arms
-    // animated) until her head is back within 7 cm for 0.5 s or the stick is pushed.
-    {
-        static bool action = false;
-        static uint64_t calmSince = 0;
-        const uint64_t lastPrompt = prompts::LastShownMs();
-        const bool stick = input.hand[0].active && std::hypot(input.hand[0].stick[0], input.hand[0].stick[1]) > 0.2f;
-        float off = 0.f;
-        const bool known = st.jodie && fpbody::HeadOffStanding(bones::EntityNode(st.jodie), &off);
-        if (kind != fp::BehaviourClass::Gameplay || stick || !known) {
-            if (action) Log("FP interaction animation over (%s): F1 again", stick ? "stick pushed" : "state changed");
-            action = false;
-        } else if (!action) {
-            if (lastPrompt && now - lastPrompt < 8000 && off > 0.12f) {
-                action = true;
-                calmSince = 0;
-                Log("FP interaction animation after a prompt (her head %.2f m from standing): F3 rules", off);
-            }
-        } else if (off < 0.07f) {
-            if (!calmSince) calmSince = now;
-            if (now - calmSince >= 500) {
-                action = false;
-                Log("FP interaction animation over (she stands again): F1 again");
-            }
-        } else {
-            calmSince = 0;
-        }
-        if (action) kind = fp::BehaviourClass::Cutscene;
-    }
     if (kind != fp::BehaviourClass::Cutscene) g_f3NeedsCalibration = true;  // also with F1 off
     else if (st.control == player::Control::Aiden) kind = fp::BehaviourClass::NativeFirstPerson;
-    const fp::Mode mode = fp::Classify(kind, g_f1, g_f3);
+    // EXP-047 (owner: "it should switch from following Jodie to following the possessed NPC"): with the possession
+    // option on, F1 alone puts the view in the possessed body, also while the scripts animate it (cutscene rules:
+    // the view on its animated head), not only while the player walks it.
+    const fp::Mode mode = fp::Classify(kind, g_f1, g_f3 || (st.possessed && g_f1));
     {
         static int lastLogged = -1;
         const int state = int(kind) * 4 + int(mode) + (st.jodie ? 0 : 64);
         if (state != lastLogged) {
             lastLogged = state;
-            Log("FP state: control=%s F1=%d F3=%d -> %s%s", player::Name(st.control), int(g_f1), int(g_f3),
+            Log("FP state: control=%s F1=%d F3=%d -> %s%s", player::Name(st.control),
+                int(g_f1), int(g_f3),
                 mode == fp::Mode::FirstPerson ? "first person" :
                 mode == fp::Mode::NativeFirstPerson ? "game's own first person (Aiden)" : "game camera",
-                st.jodie ? "" : " (Jodie not found yet)");
+                !st.jodie ? " (Jodie not found yet)" : st.menu ? " (main menu)" : "");
         }
     }
     // Owner 0.16.12: in the DPA rooms the game cuts to a security-camera view with a filter while
@@ -530,15 +615,23 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     void* node = bones::EntityNode(st.jodie);
     void* skeleton = SkeletonOf(node);
     if (!node || !skeleton) { Suspend(); return; }
-    fpbody::Watch(node, skeleton);
     const bool newActor = node != g_actorNode || skeleton != g_actorSkeleton;
+    if (newActor) {
+        // EXP-046: which body this is (Jodie's model family, or a possessed body) decides the body rules.
+        char why[256] = "a body Aiden possesses";
+        const int family = st.possessed ? int(bodykind::Family::Other) : player::Family(st.jodie, why, sizeof(why));
+        fpbody::Identify(skeleton, family, why);
+        Log("FP first-person body %p: %s (%s)", st.jodie, bodykind::Name(static_cast<bodykind::Family>(family)), why);
+    }
+    fpbody::Watch(node, skeleton);
     if (newActor) {
         fpbody::Suspend();
         g_actorNode = node;
         g_actorSkeleton = skeleton;
-        g_eye.Reset(reinterpret_cast<uintptr_t>(skeleton));
+        g_eyes.Reset(reinterpret_cast<uintptr_t>(skeleton));
         g_implausibleEyeFrames = 0;
         g_lastAnchor = 0;
+        g_f3NeedsCalibration = true;  // EXP-047: another body (a possession): its own head -> view calibration
     }
     // Owner 0.16.11: F3 put the view inside a T-posed Jodie at a scene change (LIVE: rootYaw 0,
     // no skinning writes). Her bind pose means the game is not animating her: the game camera
@@ -579,7 +672,7 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     const bool promptsShowing = prompts::Showing(now);
     if (kind == fp::BehaviourClass::Gameplay && right.active && !promptsShowing) {
         if (!g_snapTurn) {
-            if (std::fabs(right.stick[0]) > 0.25f) g_viewYaw -= right.stick[0] * 2.0943951f * dt;
+            if (std::fabs(right.stick[0]) > 0.25f) g_viewYaw -= right.stick[0] * 2.0943951f * g_turnSpeed * dt;
         } else if (const int step = g_snap.Step(right.stick[0], dt)) {
             g_viewYaw -= float(step) * g_snapStep;
         }
@@ -601,23 +694,42 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     const bool anchors = cleanHead && cleanRoot && fp::ValidMatrix(head) && fp::ValidMatrix(root);
     if (anchors) {
         if (kind == fp::BehaviourClass::Gameplay) {
+            // EXP-059: on foot or riding (her motion kit synced to the horse's), each with its own eye.
+            if (g_eyes.Update(reinterpret_cast<uintptr_t>(skeleton), st.kitRead, reinterpret_cast<uintptr_t>(st.synced))) {
+                if (g_eyes.Riding())
+                    Log("FP eye: riding (motion kit synced to graph %p): the ride's own eye height%s", st.synced,
+                        g_eyes.Ride().Ready() ? " (kept)" : " (learning)");
+                else
+                    Log("FP eye: on foot again (motion kit not synced): the on-foot eye height%s",
+                        g_eyes.Foot().Ready() ? " (kept from before the ride)" : " (learning)");
+            }
+            const bool riding = g_eyes.Riding();
+            fp::StableEye& eye = g_eyes.Active();
             // Calibrate on normal standing / walking frames only; after ~2.5 s without one
             // (a long crouch or climb) take what there is rather than stay in third person.
-            const bool plausible = fp::PlausibleStandingHead(head, root) || g_implausibleEyeFrames > 225;
-            if (!plausible && !g_eye.Ready()) ++g_implausibleEyeFrames;
-            g_eye.Sample(reinterpret_cast<uintptr_t>(skeleton), head, root, plausible);
-            if (!g_eye.HasSample()) { Suspend(); return; }
-            const pose::Mat4 next = g_eye.Base(root, fp::YawOf(root), g_viewYaw, g_eyeForward, g_eyeUp);
+            // A rider sits on the horse: the standing range does not apply (her head ~2.3 m above her root; the scripts
+            // give the horse's controller a 2.4 m height, SetHeight(2.4) in fControlHorse).
+            const bool plausible = riding || fp::PlausibleStandingHead(head, root) || g_implausibleEyeFrames > 225;
+            if (!plausible && !eye.Ready()) ++g_implausibleEyeFrames;
+            const bool wasReady = eye.Ready();
+            eye.Sample(reinterpret_cast<uintptr_t>(skeleton), head, root, plausible);
+            if (!eye.HasSample()) { Suspend(); return; }
+            const pose::Mat4 next = eye.Base(root, fp::YawOf(root), g_viewYaw, g_eyeForward, g_eyeUp);
             // Large authored moves start a fresh base rather than blending across a teleport.
             if (g_baseValid && !fp::PlausibleStep({g_base.m[12], g_base.m[13], g_base.m[14]},
                                                 {next.m[12], next.m[13], next.m[14]}, 3.f)) {
-                g_eye.Reset(reinterpret_cast<uintptr_t>(skeleton));
-                g_implausibleEyeFrames = 0;
-                g_eye.Sample(reinterpret_cast<uintptr_t>(skeleton), head, root, fp::PlausibleStandingHead(head, root));
+                Log("FP eye relearned (%s): the view base jumped %.1f m in one frame", riding ? "riding" : "on foot",
+                    fp::Len(fp::Sub({g_base.m[12], g_base.m[13], g_base.m[14]}, {next.m[12], next.m[13], next.m[14]})));
+                eye.Reset(reinterpret_cast<uintptr_t>(skeleton));
+                if (!riding) g_implausibleEyeFrames = 0;
+                eye.Sample(reinterpret_cast<uintptr_t>(skeleton), head, root, riding || fp::PlausibleStandingHead(head, root));
                 // No usable sample yet: an empty calibration would put the view at her feet.
-                if (!g_eye.HasSample()) { Suspend(); return; }
+                if (!eye.HasSample()) { Suspend(); return; }
             }
-            g_base = g_eye.Base(root, fp::YawOf(root), g_viewYaw, g_eyeForward, g_eyeUp);
+            if (!wasReady && eye.Ready())
+                Log("FP eye height learned (%s): her head %.2f m above her root (%d frames)",
+                    riding ? "riding" : "on foot", eye.Offset().y, eye.Samples());
+            g_base = eye.Base(root, fp::YawOf(root), g_viewYaw, g_eyeForward, g_eyeUp);
             // Walking upright: her eyes look roughly level, so this is the head -> view calibration.
             pose::Vec3 eyeL{}, eyeR{};
             float face = 0.f;
@@ -876,7 +988,16 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     plan.armsActive = g_arms && kind == fp::BehaviourClass::Gameplay && anchors;
     plan.turnBody = kind == fp::BehaviourClass::Gameplay;
     plan.moveStick = input.hand[0].active && std::hypot(input.hand[0].stick[0], input.hand[0].stick[1]) > 0.2f;
-    plan.wristPitch = g_wristPitch;
+    {
+        const int family = fp::HeadsetFamily(xr::SystemName());
+        if (family != g_family) {
+            g_family = family;
+            Log("FP wrist angle for %s (OpenXR system \"%s\"): %.1f deg; hands %s", family == 0 ? "PS VR2" :
+                family == 1 ? "Meta Quest" : "other headsets", xr::SystemName(), g_wristPitchFamily[family] * 57.29578f,
+                g_handSmoothing ? "smoothed" : "raw");
+        }
+        plan.wristPitch = g_wristPitchFamily[family];
+    }
     const pose::Mat4 headWorld = pose::Mul(input.headRel, g_base);
     g_eyeWorld[0] = headWorld.m[12];
     g_eyeWorld[1] = headWorld.m[13];
@@ -913,7 +1034,10 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
     plan.eyeUp = g_eyeUp;
     for (int i = 0; i < 2; ++i) {
         plan.handValid[i] = plan.armsActive && input.hand[i].active && input.hand[i].gripValid;
-        plan.handWorld[i] = pose::Mul(input.hand[i].gripRel, g_base);
+        pose::Mat4 grip = input.hand[i].gripRel;
+        if (!plan.handValid[i] || !g_handSmoothing) g_handFilter[i].Reset();
+        else grip = g_handFilter[i].Feed(grip, input.displayTime, input.recenterEpoch, g_handCutoff, g_handBeta);
+        plan.handWorld[i] = pose::Mul(grip, g_base);
         plan.trigger[i] = input.hand[i].trigger;
         plan.grip[i] = input.hand[i].squeeze;
     }
@@ -962,7 +1086,7 @@ bool Command(const char* verb, const char* arg) {
         Log("FPSTATUS ready=%d foreground=%d F1=%d F3=%d arms=%d mode=%d base=%d control=%s jodie=%p camera=%p actor=%p skeleton=%p eyeSamples=%d viewYaw=%.1f",
             int(g_ready), int(GameForeground()), int(g_f1), int(g_f3), int(g_arms),
             int(g_lastMode), int(g_baseValid), player::Name(st.control), st.jodie,
-            g_cameraNode, g_actorNode, g_actorSkeleton, int(g_eye.HasSample()), g_viewYaw * 57.29578f);
+            g_cameraNode, g_actorNode, g_actorSkeleton, int(g_eyes.Active().HasSample()), g_viewYaw * 57.29578f);
         Log("FPSTATUS body final=%llu capture=%llu writes=%llu failure=%u first=%d node=%p skeleton=%p worlds=%p count=%u head=%u yaw=%.1f->%.1f hands=%d,%d chains=%u/%u/%u,%u/%u/%u",
             body.selectedFinalCalls, body.captureValid, body.applyWrites, body.lastFailure,
             int(body.firstSuccess), reinterpret_cast<void*>(body.node), reinterpret_cast<void*>(body.skeleton),
@@ -1006,6 +1130,37 @@ bool Command(const char* verb, const char* arg) {
         Log("FP body edits: %s", on ? "on" : "off");
         return true;
     }
+    if (std::strcmp(verb, "fpclothpose") == 0) {  // EXP-056 A/B: one cloth pose (default) or the earlier mix
+        const bool one = !arg || std::strcmp(arg, "old") != 0;
+        fpbody::SetClothOnePose(one);
+        Log("FP cloth pose: %s", one ? "one physics pose for every cloth input (named rigs)" : "earlier mix");
+        return true;
+    }
+    if (std::strcmp(verb, "fpitemcull") == 0) {  // 0.24.0 A/B: held items tested where drawn (on) or engine only (off)
+        const bool on = !arg || std::strcmp(arg, "off") != 0;
+        fpbody::SetItemCull(on);
+        Log("FP held items in the engine's visibility: %s", on ? "also tested where they are drawn" : "engine result only");
+        return true;
+    }
+    if (std::strcmp(verb, "fphead") == 0) {  // fphead show|hide|cutscene
+        fpbody::SetHeadMode(arg && std::strcmp(arg, "show") == 0   ? fpbody::kHeadShown
+                            : arg && std::strcmp(arg, "hide") == 0 ? fpbody::kHeadHidden
+                                                                   : fpbody::kHeadHiddenInCutscenes);
+        Log("FP head in first person: %s", fpbody::HeadModeName(fpbody::GetHeadMode()));
+        return true;
+    }
+    if (std::strcmp(verb, "fpclothjump") == 0) {  // EXP-056 A/B: engine cloth teleport on first-person pose jumps
+        const bool on = !arg || std::strcmp(arg, "off") != 0;
+        fpbody::SetClothTeleports(on);
+        Log("FP cloth teleport on pose jumps: %s", on ? "on" : "off");
+        return true;
+    }
+    if (std::strcmp(verb, "fpheadcloth") == 0) {  // 0.26.0 A/B: her hair cloth hidden with her head
+        const bool on = !arg || std::strcmp(arg, "off") != 0;
+        fpbody::SetHeadCloth(on);
+        Log("FP hair cloth hidden with her head: %s", on ? "on" : "off");
+        return true;
+    }
     if (std::strcmp(verb, "fprestore") == 0) {
         const bool on = !arg || std::strcmp(arg, "off") != 0;
         fpbody::SetRestoreAtPublish(on);
@@ -1036,7 +1191,8 @@ bool Command(const char* verb, const char* arg) {
     }
     if (std::strcmp(verb, "fpwrist") == 0 && arg) {
         g_wristPitch = std::clamp(static_cast<float>(std::atof(arg)), -90.f, 90.f) * 0.017453293f;
-        Log("FP wrist pitch=%.1f deg", g_wristPitch * 57.29578f);
+        for (float& f : g_wristPitchFamily) f = g_wristPitch;
+        Log("FP wrist pitch=%.1f deg (every headset family, until the next start)", g_wristPitch * 57.29578f);
         return true;
     }
     if (std::strcmp(verb, "turn") == 0 && arg) {

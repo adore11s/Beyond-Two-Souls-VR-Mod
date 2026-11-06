@@ -13,6 +13,10 @@ bool Install();
 
 // Scene node of a SINT script entity, or nullptr.
 void* EntityNode(void* scriptEntity);
+// The model object of a SINT script entity (the cached +0x300 handle's object: an M3D::SKELETON on
+// characters), and that handle itself; nullptr when not cached.
+void* EntityModel(void* scriptEntity);
+void* EntityModelHandle(void* scriptEntity);
 
 // World matrix of the named bone (by CRC32 of its name) on a node's skeleton, or nullptr.
 const float* BoneWorld(void* node, uint32_t nameHash);

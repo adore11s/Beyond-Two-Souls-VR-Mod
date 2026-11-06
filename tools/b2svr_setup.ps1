@@ -1,107 +1,39 @@
 # ===========================================================================
-#  BEYOND: TWO SOULS - VR MOD : installer / launcher / uninstaller
+#  BEYOND: TWO SOULS - VR MOD : installer / uninstaller
 #
 #  Called by the two .cmd files in the B2S_VR_MOD folder:
-#    "Play Beyond Two Souls in VR.cmd"  ->  -Mode Play       (install or update, then start the game)
-#    "Uninstall VR mod.cmd"             ->  -Mode Uninstall  (put the game folder back as it was)
-#  For checking without changing anything:  -Mode Check
+#    "Install VR mod.cmd"    ->  -Mode Install    (once: dinput8.dll next to the game's exe)
+#    "Uninstall VR mod.cmd"  ->  -Mode Uninstall  (the mod's own files to the Recycle Bin)
 #
-#  The mod is a single file, dinput8.dll, placed next to the game's exe (BeyondTwoSouls_Steam.exe or
-#  the exe of another store's copy). Windows loads it into the game whichever way the game is started
-#  (Steam, the Epic Games Launcher or the exe). Nothing is injected, and no game file is replaced,
-#  patched or edited on disk. Steam copies also get a steam_appid.txt (only when there is none) so the
-#  exe can be started directly; the uninstaller removes it only if this script created it.
+#  The mod is a single file, dinput8.dll, next to the game's exe (BeyondTwoSouls_Steam.exe or the exe of another
+#  store's copy). Windows loads it into the game whichever way the game is started (Steam, Epic, the exe) - nothing
+#  is injected and no game file is replaced or patched on disk. The mod writes its own b2svr.ini and b2svr_logs
+#  folder next to the exe.
 #
-#  -NoLaunch    do everything except starting SteamVR and the game, and (uninstall) deleting this
-#               folder (testing)
-#  -GameDir     the game folder, instead of finding it
-#  -Unattended  answer every question with its default instead of asking (testing)
+#  The uninstaller NEVER deletes anything for good: everything it removes goes to the Recycle Bin, and only from a
+#  fixed list of the mod's own files - never an .exe, never a folder holding one, never the game folder itself or
+#  anything outside it.
 #
 #  Kept ASCII only: Windows PowerShell 5.1 reads a script without a BOM in the ANSI code page.
 # ===========================================================================
-param(
-    [ValidateSet('Play', 'Uninstall', 'Check')][string]$Mode = 'Play',
-    [switch]$NoLaunch,
-    [switch]$Unattended,
-    [string]$GameDir = ''
-)
+param([ValidateSet('Install', 'Uninstall')][string]$Mode = 'Install')
 
 $ErrorActionPreference = 'Stop'
 $ModDir = Split-Path -Parent $PSScriptRoot
 $Files = Join-Path $ModDir 'files'
-$StateGame = Join-Path $ModDir 'game_dir.txt'   # where the mod was installed (for the uninstaller)
-# Everything this script prints also goes to setup_log.txt in the B2S_VR_MOD folder (the previous run:
-# setup_log.prev.txt), with the Windows user name replaced by <user>: the file players send when the
-# installer / launcher fails.
-$SetupLog = Join-Path $ModDir 'setup_log.txt'
+$StateGame = Join-Path $ModDir 'game_dir.txt'           # where the mod was installed (for the uninstaller)
+$StateSettings = Join-Path $ModDir 'settings_changed.txt' # game options the installer changed: KEY=original|set
+$OptionsBackup = Join-Path $ModDir 'game_options_backup.bin'  # the game's options file before the first change
+# An older launcher created steam_appid.txt (marked by this file): the uninstaller removes it.
+$AppIdMarker = 'b2svr_steam_appid.created'
 
-# The game's exe: the Steam name first, then any other store's (BeyondTwoSouls*.exe).
-$ExeNames = @('BeyondTwoSouls_Steam.exe', 'BeyondTwoSouls.exe')
-$ExeName = 'BeyondTwoSouls_Steam.exe'   # set to the found exe once the game folder is known
-# The build the mod's game addresses were recorded on (PE header). Any other build works too: the
-# mod finds its addresses by signature at startup and switches off only what it cannot find.
-$KnownTimeStamp = 0x5eb531da
-$KnownImageSize = 0x02120000
-$AppIdMarker = 'b2svr_steam_appid.created'  # in the game folder: steam_appid.txt was written by us
-
-# Files the mod writes into the game folder (removed on request by the uninstaller). The last six
-# are written only by development builds of the mod.
-$ModDataFiles = @('b2svr.ini', 'b2svr.log', 'b2svr.prev.log', 'b2svr_cmd.txt', 'b2svr_cmd.done',
-                  'b2svr_camdump.bin', 'b2svr_vpdump.bin')
-
-# Privacy: setup_log.txt never names the player. Folder paths become <game folder> / <mod folder> /
-# <user profile>, the Windows user name (as a path part) <user>, the computer name <pc>. The screen
-# still shows the real paths.
-$script:ScrubPaths = New-Object System.Collections.ArrayList
-function Add-Scrub([string]$path, [string]$with) {
-    if ($path -and $path.Length -gt 3) { [void]$script:ScrubPaths.Add(@($path.TrimEnd('\', '/'), $with)) }
-}
-Add-Scrub $ModDir '<mod folder>'
-Add-Scrub $env:USERPROFILE '<user profile>'
-function Protect-Text([string]$t) {
-    # longest paths first, so a folder inside another one is named by its own label
-    foreach ($e in ($script:ScrubPaths | Sort-Object { $_[0].Length } -Descending)) {
-        $t = $t -replace [regex]::Escape($e[0]), $e[1]
-    }
-    $u = $env:USERNAME
-    if ($u -and $u.Length -gt 1) { $t = $t -replace ('(?i)(?<=[\\/])' + [regex]::Escape($u) + '(?=[\\/]|$)'), '<user>' }
-    $c = $env:COMPUTERNAME
-    if ($c -and $c.Length -gt 1) { $t = $t -replace [regex]::Escape($c), '<pc>' }
-    return $t
-}
-function Write-SetupLog([string]$t) {
-    try {
-        $t = Protect-Text $t
-        Add-Content -LiteralPath $SetupLog -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $t) -Encoding UTF8
-    } catch { }
-}
-function Say([string]$t) { Write-Host "   $t"; Write-SetupLog $t }
-function Warn([string]$t) { Write-Host "   [!] $t" -ForegroundColor Yellow; Write-SetupLog "[!] $t" }
-function Bad([string]$t) { Write-Host "   [X] $t" -ForegroundColor Red; Write-SetupLog "[X] $t" }
-function Ask([string]$prompt, [string]$default) {
-    if ($Unattended) { Say "$prompt -> $default (unattended)"; return $default }
-    return (Read-Host "   $prompt")
-}
+function Say([string]$t) { Write-Host "   $t" }
+function Warn([string]$t) { Write-Host "   [!] $t" -ForegroundColor Yellow }
+function Bad([string]$t) { Write-Host "   [X] $t" -ForegroundColor Red }
 function Done([int]$code) {
     Write-Host ''
-    if (-not $Unattended) { [void](Read-Host '   Press Enter to close') }
+    [void](Read-Host '   Press Enter to close')
     exit $code
-}
-# A new setup log for this run (the previous one kept as setup_log.prev.txt).
-try {
-    if (Test-Path -LiteralPath $SetupLog) {
-        Move-Item -LiteralPath $SetupLog -Destination (Join-Path $ModDir 'setup_log.prev.txt') -Force
-    }
-} catch { }
-Write-SetupLog ("B2S VR mod setup, mode $Mode; PowerShell $($PSVersionTable.PSVersion); " +
-                "$([Environment]::OSVersion.VersionString); 64-bit OS: $([Environment]::Is64BitOperatingSystem)")
-
-# Any error this script did not expect: shown, written to setup_log.txt, and the window stays open.
-trap {
-    Bad ('Unexpected error: ' + $_.Exception.Message)
-    Write-SetupLog ('  at line ' + $_.InvocationInfo.ScriptLineNumber + ': ' + $_.InvocationInfo.Line.Trim())
-    Say 'Please send setup_log.txt (in this B2S_VR_MOD folder) with your bug report.'
-    Done 1
 }
 
 function Banner([string]$title) {
@@ -112,32 +44,32 @@ function Banner([string]$title) {
     Write-Host ''
 }
 
-# ---- the game folder ------------------------------------------------------------------------------
+# ---- the game folder ---------------------------------------------------------------------------------------------
+# The game's exe: the Steam name, another store's name, or any BeyondTwoSouls*.exe.
 function Get-GameExe([string]$d) {
-    if (-not $d -or -not (Test-Path -LiteralPath $d)) { return $null }
-    foreach ($n in $ExeNames) { if (Test-Path -LiteralPath (Join-Path $d $n)) { return $n } }
+    if (-not $d -or -not (Test-Path -LiteralPath $d -PathType Container)) { return $null }
+    foreach ($n in @('BeyondTwoSouls_Steam.exe', 'BeyondTwoSouls.exe')) {
+        if (Test-Path -LiteralPath (Join-Path $d $n)) { return $n }
+    }
     $e = Get-ChildItem -LiteralPath $d -Filter 'BeyondTwoSouls*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($e) { return $e.Name }
     return $null
 }
 function Test-GameDir([string]$d) { return [bool](Get-GameExe $d) }
-function Use-GameDir([string]$d) { $script:ExeName = Get-GameExe $d; return $d }
 
 function Find-GameDir {
-    if ($GameDir) {
-        if (Test-GameDir $GameDir) { return (Resolve-Path -LiteralPath $GameDir).Path }
-        Bad "-GameDir $GameDir does not contain a Beyond: Two Souls exe"
-        return $null
-    }
-    # 1. this folder sits inside the game folder (the normal way, see README)
+    # 0. the mod's files were copied straight into the game folder: that folder (never another install)
+    if (Test-GameDir $ModDir) { return (Resolve-Path -LiteralPath $ModDir).Path }
+    # 1. this B2S_VR_MOD folder sits inside the game folder (the normal way, see README)
     $parent = Split-Path -Parent $ModDir
-    if (Test-GameDir $parent) { return $parent }
+    if (Test-GameDir $parent) { return (Resolve-Path -LiteralPath $parent).Path }
     # 2. where the last install went
     if (Test-Path -LiteralPath $StateGame) {
         $d = (Get-Content -LiteralPath $StateGame -Raw).Trim()
-        if (Test-GameDir $d) { return $d }
+        if (Test-GameDir $d) { return (Resolve-Path -LiteralPath $d).Path }
     }
     # 3. Steam libraries
+    $cands = @()
     try {
         $steam = (Get-ItemProperty -Path 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath
         if ($steam) {
@@ -150,21 +82,25 @@ function Find-GameDir {
             }
             foreach ($l in ($libs | Select-Object -Unique)) {
                 $common = Join-Path $l 'steamapps\common'
-                if (-not (Test-Path -LiteralPath $common)) { continue }
-                foreach ($g in Get-ChildItem -LiteralPath $common -Directory -ErrorAction SilentlyContinue) {
-                    if (Test-GameDir $g.FullName) { return $g.FullName }
-                }
+                $cands += (Join-Path $common 'Beyond Two Souls')
+                foreach ($g in Get-ChildItem -LiteralPath $common -Directory -ErrorAction SilentlyContinue) { $cands += $g.FullName }
             }
         }
     } catch { }
     # 4. Epic Games Launcher installs
-    foreach ($m in (Get-EpicManifests)) { if (Test-GameDir $m.InstallLocation) { return $m.InstallLocation } }
+    $man = Join-Path $env:ProgramData 'Epic\EpicGamesLauncher\Data\Manifests'
+    if (Test-Path -LiteralPath $man) {
+        foreach ($f in Get-ChildItem -LiteralPath $man -Filter '*.item' -ErrorAction SilentlyContinue) {
+            try { $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            if ($j.InstallLocation) { $cands += $j.InstallLocation }
+        }
+    }
+    foreach ($c in $cands) { if (Test-GameDir $c) { return (Resolve-Path -LiteralPath $c).Path } }
     # 5. ask
     Warn 'Could not find Beyond: Two Souls by itself.'
-    Say 'Easiest fix: move this whole B2S_VR_MOD folder INTO your Beyond: Two Souls folder'
-    Say '(the one that contains BeyondTwoSouls_Steam.exe or BeyondTwoSouls.exe) and run this again.'
+    Say 'Easiest fix: put this whole B2S_VR_MOD folder INTO your Beyond: Two Souls folder'
+    Say '(the one that contains BeyondTwoSouls_Steam.exe) and run this again.'
     Write-Host ''
-    if ($Unattended) { return $null }
     $d = (Read-Host '   Or paste the Beyond: Two Souls folder here and press Enter').Trim().Trim('"')
     if (Test-GameDir $d) { return (Resolve-Path -LiteralPath $d).Path }
     return $null
@@ -172,314 +108,323 @@ function Find-GameDir {
 
 function Test-GameRunning { return [bool](Get-Process -Name 'BeyondTwoSouls*' -ErrorAction SilentlyContinue) }
 
-# ---- stores ---------------------------------------------------------------------------------------
-function Get-EpicManifests {
-    $dir = Join-Path $env:ProgramData 'Epic\EpicGamesLauncher\Data\Manifests'
-    $out = @()
-    foreach ($f in Get-ChildItem -LiteralPath $dir -Filter '*.item' -ErrorAction SilentlyContinue) {
-        try {
-            $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
-            if ($j.InstallLocation -and $j.AppName) { $out += $j }
-        } catch { }
-    }
-    return $out
-}
-function Get-EpicApp([string]$game) {
-    foreach ($m in (Get-EpicManifests)) {
-        try { if ((Resolve-Path -LiteralPath $m.InstallLocation).Path -eq $game) { return $m } } catch { }
-    }
-    return $null
-}
-# A Steam copy: <library>\steamapps\common\<dir> with an appmanifest whose installdir is <dir>.
-# Returns its app id, or $null.
-function Get-SteamAppId([string]$game) {
-    $common = Split-Path -Parent $game
-    if ((Split-Path -Leaf $common) -ne 'common') { return $null }
-    $apps = Split-Path -Parent $common
-    foreach ($f in Get-ChildItem -LiteralPath $apps -Filter 'appmanifest_*.acf' -ErrorAction SilentlyContinue) {
-        $t = Get-Content -LiteralPath $f.FullName -Raw
-        $inst = [regex]::Match($t, '"installdir"\s+"([^"]+)"').Groups[1].Value
-        if ($inst -eq (Split-Path -Leaf $game)) {
-            $id = [regex]::Match($t, '"appid"\s+"(\d+)"').Groups[1].Value
-            if ($id) { return $id }
-        }
-    }
-    return $null
-}
-function Get-Store([string]$game) {
-    if (Get-SteamAppId $game) { return 'Steam' }
-    if (Get-EpicApp $game) { return 'Epic Games' }
-    return 'other'
-}
-
-# ---- dinput8.dll ----------------------------------------------------------------------------------
-# Ours = a B2SVR build (its first log line "B2SVR <version> built ..." is in the file). Any other
-# dinput8.dll belongs to another mod or tool (ASI loaders, overlays) and is never replaced or deleted.
+# ---- dinput8.dll -------------------------------------------------------------------------------------------------
+# Ours = a B2SVR build (its log line "B2SVR <version> built ..." is in the file). Anything else named dinput8.dll
+# belongs to another mod / tool (ASI loaders, overlays) and is never overwritten or removed.
 function Test-OurDll([string]$path) {
     $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($path))
     return $text.Contains('B2SVR ') -and $text.Contains(' built ')
 }
 
-function Read-ExeId([string]$exe) {
-    $fs = [IO.File]::OpenRead($exe)
-    try {
-        $br = New-Object IO.BinaryReader($fs)
-        $fs.Position = 0x3C; $pe = $br.ReadInt32()
-        $fs.Position = $pe + 8; $ts = $br.ReadUInt32()
-        $fs.Position = $pe + 24 + 56; $size = $br.ReadUInt32()
-        return @{ TimeStamp = $ts; Size = $size }
-    } finally { $fs.Close() }
-}
+# ---- the Recycle Bin, with every check ---------------------------------------------------------------------------
+Add-Type -AssemblyName Microsoft.VisualBasic
 
-function Test-KnownBuild([string]$game) {
-    $id = Read-ExeId (Join-Path $game (Get-GameExe $game))
-    return @{ Known = ($id.TimeStamp -eq $KnownTimeStamp -and $id.Size -eq $KnownImageSize); Id = $id }
-}
-
-# ---- b2svr.ini ------------------------------------------------------------------------------------
-# One key of the [b2svr] section. Every other line is kept as it is; the file may mix CRLF and LF
-# line ends, so lines are split on either and written back with CRLF.
-function Get-IniValue([string]$path, [string]$key) {
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    foreach ($line in ([IO.File]::ReadAllText($path) -split "\r?\n")) {
-        if ($line -match ('^\s*' + [regex]::Escape($key) + '\s*=\s*(.*?)\s*$')) { return $Matches[1] }
+# Sends `path` to the Recycle Bin - never deletes for good. Refuses (and says so): anything outside the game folder,
+# the game folder itself, an .exe, a folder that holds an .exe anywhere inside it.
+function Send-ToRecycleBin([string]$path, [string]$game) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    $g = [IO.Path]::GetFullPath($game).TrimEnd('\')
+    if ($full -ieq $g -or -not $full.StartsWith($g + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        Warn "Not removed (not a file inside the game folder): $full"
+        return $false
     }
-    return $null
-}
-function Set-IniValue([string]$path, [string]$key, [string]$value) {
-    $text = ''
-    if (Test-Path -LiteralPath $path) { $text = [IO.File]::ReadAllText($path) }
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($l in ($text -split "\r?\n")) { $lines.Add($l) }
-    while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
-    $section = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[b2svr\]\s*$') { $section = $i; break } }
-    if ($section -lt 0) { $lines.Add('[b2svr]'); $section = $lines.Count - 1 }
-    $end = $lines.Count   # the next section starts here
-    for ($i = $section + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[') { $end = $i; break } }
-    $set = $false
-    for ($i = $section + 1; $i -lt $end; $i++) {
-        if ($lines[$i] -match ('^\s*' + [regex]::Escape($key) + '\s*=')) { $lines[$i] = "$key=$value"; $set = $true; break }
-    }
-    if (-not $set) { $lines.Insert($end, "$key=$value") }
-    [IO.File]::WriteAllText($path, (($lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding $false))
-}
-
-# The VR settings asked on every Play (just Enter keeps the current choice).
-$RenderSizes = @(1440, 1728, 2048, 2304, 2560, 2816)
-$RenderNotes = @('fastest', '', 'recommended', '', '', 'sharpest')
-function Select-VrSettings([string]$ini) {
-    Write-Host ''
-    Say 'VR picture size: a square picture for each eye, in pixels.'
-    Say 'Bigger = sharper, but it needs a faster graphics card.'
-    $current = Get-IniValue $ini 'render_size'
-    $default = 3
-    for ($i = 0; $i -lt $RenderSizes.Count; $i++) { if ("$($RenderSizes[$i])" -eq $current) { $default = $i + 1 } }
-    for ($i = 0; $i -lt $RenderSizes.Count; $i++) {
-        $note = ''
-        if ($RenderNotes[$i]) { $note = '   (' + $RenderNotes[$i] + ')' }
-        Write-Host ('     {0}. {1} x {1}{2}' -f ($i + 1), $RenderSizes[$i], $note)
-    }
-    $a = "$(Ask "Type 1-6 and press Enter (just Enter keeps $default)" "$default")".Trim()
-    if (-not $a) { $a = "$default" }
-    $n = 0
-    if (-not [int]::TryParse($a, [ref]$n) -or $n -lt 1 -or $n -gt $RenderSizes.Count) {
-        Warn "'$a' is not 1-6: keeping $default"
-        $n = $default
-    }
-    $size = $RenderSizes[$n - 1]
-    Set-IniValue $ini 'render_size' "$size"
-    Say "VR picture size: $size x $size"
-
-    Write-Host ''
-    Say 'Turning with the right stick in first person (F1):'
-    Write-Host '     1. Smooth turning'
-    Write-Host '     2. Snap turning (turns in steps)'
-    $default = 1
-    if ((Get-IniValue $ini 'turn') -eq 'snap') { $default = 2 }
-    $a = "$(Ask "Type 1 or 2 and press Enter (just Enter keeps $default)" "$default")".Trim()
-    if (-not $a) { $a = "$default" }
-    if ($a -ne '1' -and $a -ne '2') {
-        Warn "'$a' is not 1 or 2: keeping $default"
-        $a = "$default"
-    }
-    if ($a -eq '2') { $turn = 'snap' } else { $turn = 'smooth' }
-    Set-IniValue $ini 'turn' $turn
-    Say "Turning in first person: $turn"
-}
-
-# ---- starting things ------------------------------------------------------------------------------
-function Start-Game([string]$game) {
-    $id = Get-SteamAppId $game
-    if ($id) {
-        Say "Starting Beyond: Two Souls through Steam (app $id)"
-        Start-Process "steam://rungameid/$id"
-        return
-    }
-    $epic = Get-EpicApp $game
-    if ($epic) {
-        Say 'Starting Beyond: Two Souls through the Epic Games Launcher'
-        Start-Process ('com.epicgames.launcher://apps/' + $epic.AppName + '?action=launch&silent=true')
-        return
-    }
-    Say "Starting $ExeName"
-    Start-Process -FilePath (Join-Path $game $ExeName) -WorkingDirectory $game
-}
-
-function Start-SteamVRIfNeeded {
-    if (Get-Process -Name 'vrserver' -ErrorAction SilentlyContinue) { Say 'SteamVR is running'; return }
-    if (Get-Process -Name 'VirtualDesktop.Streamer' -ErrorAction SilentlyContinue) { Say 'Virtual Desktop is running'; return }
-    if (Test-Path -LiteralPath 'Registry::HKEY_CLASSES_ROOT\steam') {
-        Say 'Starting SteamVR...'
-        Start-Process 'steam://run/250820'
+    if (Test-Path -LiteralPath $full -PathType Leaf) {
+        if ([IO.Path]::GetExtension($full) -ieq '.exe') { Warn "Not removed (a program file): $full"; return $false }
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($full, 'OnlyErrorDialogs', 'SendToRecycleBin')
     } else {
-        Warn 'SteamVR is not running - start it (or your OpenXR runtime) now.'
-    }
-}
-
-# ---- removing this B2S_VR_MOD folder (uninstall) --------------------------------------------------
-# Deletes only the files the release shipped (tools\release_files.txt) and the installer's own state;
-# a folder goes only once it is empty, never with what is inside it. Anything else kept here stays,
-# and so does the folder. When this folder is the game folder or holds a game exe (the release
-# unpacked straight into the game folder), nothing here is deleted.
-$Manifest = Join-Path $PSScriptRoot 'release_files.txt'
-$RunningCmd = 'Uninstall VR mod.cmd'   # cmd.exe still reads it: deleted after this script exits
-$StateFiles = @('game_dir.txt', 'setup_log.txt', 'setup_log.prev.txt')
-
-function Test-InsideModDir([string]$path) {
-    $root = [IO.Path]::GetFullPath($ModDir).TrimEnd('\') + '\'
-    return [IO.Path]::GetFullPath($path).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
-}
-
-# Returns $true when the rest (the running .cmd, the setup logs, the folder if empty) may go once
-# this script has exited.
-function Remove-ModFiles([string]$game) {
-    if ([IO.Path]::GetFullPath($ModDir).TrimEnd('\') -ieq [IO.Path]::GetFullPath($game).TrimEnd('\') -or
-        (Test-GameDir $ModDir)) {
-        Warn 'The mod''s files are directly in the game folder, not in their own B2S_VR_MOD folder.'
-        Say 'To keep your game safe, none of them were deleted. Delete them yourself if you like:'
-        Say "the files listed in tools\release_files.txt, in $ModDir"
-        return $false
-    }
-    if (-not (Test-Path -LiteralPath $Manifest)) {
-        Warn "tools\release_files.txt is missing, so this folder was not deleted: $ModDir"
-        return $false
-    }
-    $dirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($rel in (@([IO.File]::ReadAllLines($Manifest)) + 'game_dir.txt')) {
-        $rel = "$rel".Trim()
-        if (-not $rel -or $rel -eq $RunningCmd -or [IO.Path]::IsPathRooted($rel) -or $rel -match '(^|[\\/])\.\.([\\/]|$)') { continue }
-        $p = Join-Path $ModDir $rel
-        if (-not (Test-InsideModDir $p)) { continue }
-        for ($d = Split-Path -Parent $p; $d -and (Test-InsideModDir $d); $d = Split-Path -Parent $d) { [void]$dirs.Add($d) }
-        if (Test-Path -LiteralPath $p -PathType Leaf) { Remove-Item -LiteralPath $p -Force }
-    }
-    foreach ($d in ($dirs | Sort-Object Length -Descending)) {   # deepest first, and only when empty
-        if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force | Select-Object -First 1)) {
-            Remove-Item -LiteralPath $d -Force
-        }
-    }
-    Say 'Deleted the mod''s files from this folder'
-    $left = @(Get-ChildItem -LiteralPath $ModDir -Force | Where-Object { $_.Name -notin (@($RunningCmd) + $StateFiles) })
-    if ($left.Count) {
-        Say 'This folder is kept: it also holds files that are not part of the mod:'
-        foreach ($i in ($left | Select-Object -First 5)) { Say "  $($i.Name)" }
-        if ($left.Count -gt 5) { Say "  ... and $($left.Count - 5) more" }
+        $exe = Get-ChildItem -LiteralPath $full -Recurse -Force -File -Filter '*.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($exe) { Warn "Not removed (it holds a program file, $($exe.Name)): $full"; return $false }
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($full, 'OnlyErrorDialogs', 'SendToRecycleBin')
     }
     return $true
 }
 
-# After this script and cmd.exe have exited: the uninstaller .cmd and the setup logs, then this
-# folder if it is empty.
-function Start-FinalCleanup {
-    $quote = { param($s) "'" + ($s -replace "'", "''") + "'" }
-    $paths = (@($RunningCmd) + $StateFiles | ForEach-Object { & $quote (Join-Path $ModDir $_) }) -join ','
-    $dir = & $quote $ModDir
-    $code = "for (`$i = 0; `$i -lt 20; `$i++) { Start-Sleep -Milliseconds 500; " +
-              "foreach (`$f in @($paths)) { Remove-Item -LiteralPath `$f -Force -ErrorAction SilentlyContinue }; " +
-              "if (-not (Test-Path -LiteralPath $(& $quote (Join-Path $ModDir $RunningCmd)))) { break } }; " +
-              "if (-not (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) " +
-              "{ Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue }"
-    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
-    Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-EncodedCommand', $enc `
-        -WorkingDirectory (Split-Path -Parent $ModDir) -WindowStyle Hidden
+# ---- the game's options file -------------------------------------------------------------------------------------
+# Beyond keeps its options in a binary file, not a settings.ini (decompiled, analysed build):
+#   path      %USERPROFILE%\Saved Games\Beyond Two Souls Steam[ Demo]\Save\Options\0  (FUN_140bbd9f0)
+#   header    CRC-32 (zlib) of everything after it, then the fields in the order the loader reads them
+#             (FUN_140d77290, version 0x23): every value is little-endian, strings are a length then the bytes.
+#   DisplayMode   int  RenderState +0xCAC: 0 windowed, 1 borderless, 2 fullscreen (FUN_1408291b0, Alt+Enter 1407acb30)
+#   Quality1..6   ints the Custom preset's choices (globals 141c8b6c8 6bc 6b8 6c4 6c0 6b0)
+#   MotionBlur    int  the Custom preset's motion blur (141b9ad94; SetMotionBlur 140d5d7c0)
+#   DepthOfField  int  the Custom preset's depth of field (141b9adbc; SetDOF 140d5d580)
+#   Preset        int  0 Low, 1 Medium, 2 High, 3 Custom (141b9addc; FUN_140d5ea30 applies it)
+# Motion blur and depth of field are only kept with the Custom preset; Low / Medium / High set their own. So the
+# installer switches a Low / Medium / High preset to Custom with exactly that preset's choices (FUN_140d5ea30's
+# table), only motion blur and depth of field off.
+$PresetChoices = @{  # Quality1..6 for presets 0 / 1 / 2 (FUN_140d5ea30)
+    0 = @(1, 0, 1, 1, 0, 0); 1 = @(2, 1, 1, 2, 1, 2); 2 = @(2, 2, 2, 2, 2, 3)
 }
-
-# ---- status (all modes) ---------------------------------------------------------------------------
-function Show-Status([string]$game) {
-    $b = Test-KnownBuild $game
-    Say ("Store: {0}" -f (Get-Store $game))
-    if ($b.Known) { Say "${ExeName}: verified build" }
-    else { Say ("{0}: build stamp 0x{1:x8} (not the verified build: game addresses are found by signature)" -f $ExeName, $b.Id.TimeStamp) }
-    $dll = Join-Path $game 'dinput8.dll'
-    if (-not (Test-Path -LiteralPath $dll)) { Say 'dinput8.dll: not installed' }
-    elseif (-not (Test-OurDll $dll)) { Warn 'dinput8.dll: present, but it is NOT this mod (another mod or tool)' }
-    elseif ((Test-Path -LiteralPath (Join-Path $Files 'dinput8.dll')) -and
-            (Get-FileHash -LiteralPath $dll).Hash -eq (Get-FileHash -LiteralPath (Join-Path $Files 'dinput8.dll')).Hash) {
-        Say 'dinput8.dll: this release is installed'
-    } else { Say 'dinput8.dll: an older or newer build of this mod is installed' }
-    $ini = Join-Path $game 'b2svr.ini'
-    if (Test-Path -LiteralPath $ini) {
-        Say ('b2svr.ini: present (VR picture size {0}, turning {1})' -f (Get-IniValue $ini 'render_size'), (Get-IniValue $ini 'turn'))
-    } else { Say 'b2svr.ini: not created yet' }
-    $reports = Join-Path $game 'b2svr_logs\crash_reports'
-    if (Test-Path -LiteralPath $reports) {
-        $n = @(Get-ChildItem -LiteralPath $reports -Filter 'crash_*.txt' -ErrorAction SilentlyContinue).Count
-        if ($n -gt 0) { Say "crash reports: $n in b2svr_logs\crash_reports" }
+$CrcTable = $null
+function Get-Crc32([byte[]]$data, [int]$start) {
+    # (PowerShell 5.1 reads 0xEDB88320 / 0xFFFFFFFF as negative Int32: the constants are written as UInt32)
+    $poly = [uint32]3988292384
+    $all = [uint32]::MaxValue
+    if (-not $script:CrcTable) {
+        $script:CrcTable = New-Object 'uint32[]' 256
+        for ($n = 0; $n -lt 256; $n++) {
+            [uint32]$c = $n
+            for ($k = 0; $k -lt 8; $k++) { if ($c -band 1) { $c = [uint32]($poly -bxor ($c -shr 1)) } else { $c = $c -shr 1 } }
+            $script:CrcTable[$n] = $c
+        }
     }
-}
-
-# ===================================================================================================
-if ($Mode -eq 'Check') {
-    Banner 'BEYOND: TWO SOULS VR MOD  -  CHECK (nothing is changed)'
-    $game = Find-GameDir
-    Add-Scrub $game '<game folder>'
-    if (-not $game) { Bad 'No Beyond: Two Souls folder found.'; Done 1 }
-    $game = Use-GameDir $game
-    Say "Game folder: $game"
-    if (Test-GameRunning) { Say 'The game is running' }
-    Show-Status $game
-    Done 0
-}
-
-# ===================================================================================================
-if ($Mode -eq 'Play') {
-    Banner 'BEYOND: TWO SOULS  -  VR MOD'
-    $payload = Join-Path $Files 'dinput8.dll'
-    if (-not (Test-Path -LiteralPath $payload)) { Bad 'files\dinput8.dll is missing - re-extract the mod.'; Done 1 }
-
-    $game = Find-GameDir
-    Add-Scrub $game '<game folder>'
-    if (-not $game) { Bad 'No Beyond: Two Souls folder - nothing was changed.'; Done 1 }
-    $game = Use-GameDir $game
-    Say "Game folder: $game"
-    if (Test-GameRunning) {
-        Warn 'Beyond: Two Souls is running. Close it, then run this again (the mod is installed while the game is closed).'
-        Done 1
+    [uint32]$crc = $all
+    for ($i = $start; $i -lt $data.Length; $i++) {
+        $crc = [uint32]($script:CrcTable[[int](($crc -bxor $data[$i]) -band 0xFF)] -bxor ($crc -shr 8))
     }
+    return [uint32]($crc -bxor $all)
+}
 
-    # the game build
-    $b = Test-KnownBuild $game
-    Say ("Store: {0}   exe: {1}" -f (Get-Store $game), $ExeName)
-    if ($b.Known) {
-        Say "${ExeName}: verified build"
+function Find-OptionsFile([string]$game) {
+    $root = Join-Path $env:USERPROFILE 'Saved Games'
+    $full = Join-Path $root 'Beyond Two Souls Steam\Save\Options\0'
+    $demo = Join-Path $root 'Beyond Two Souls Steam Demo\Save\Options\0'
+    $order = @($full, $demo)
+    if ((Split-Path -Leaf $game) -match '(?i)demo') { $order = @($demo, $full) }
+    foreach ($p in $order) { if (Test-Path -LiteralPath $p -PathType Leaf) { return $p } }
+    return $null
+}
+
+# The options file's fields: offsets of the values the installer may change, or $null (unknown version, size or CRC).
+function Read-Options([byte[]]$d) {
+    if ($d.Length -lt 16) { return $null }
+    if ([BitConverter]::ToUInt32($d, 0) -ne (Get-Crc32 $d 4)) { return $null }
+    $p = 4
+    if ([BitConverter]::ToInt32($d, $p) -ne 0x23) { return $null }
+    $p += 4
+    $p += 2                         # two bytes
+    $p += 16                        # four volumes (floats)
+    $p += 8                         # two ints
+    for ($s = 0; $s -lt 3; $s++) {  # three languages
+        if ($p + 4 -gt $d.Length) { return $null }
+        $len = [BitConverter]::ToInt32($d, $p); if ($len -lt 0 -or $len -gt 64) { return $null }
+        $p += 4 + $len
+    }
+    $p += 8                         # two ints
+    $p += 8                         # a 64-bit value
+    $p += 4                         # an int
+    $f = [ordered]@{}
+    $f['DisplayMode'] = $p; $p += 4
+    $p += 8                         # the resolution (two floats)
+    $p += 8                         # two ints
+    for ($q = 1; $q -le 6; $q++) { $f["Quality$q"] = $p; $p += 4 }
+    $f['MotionBlur'] = $p; $p += 4
+    $f['DepthOfField'] = $p; $p += 4
+    if ($p + 4 -gt $d.Length) { return $null }
+    $len = [BitConverter]::ToInt32($d, $p); if ($len -lt 0 -or $len -gt 256) { return $null }
+    $p += 4 + $len                  # the graphics card the preset was made for
+    $f['Preset'] = $p; $p += 4
+    $p += 16 + 12                   # seven ints
+    $p += 2 * 26 * 4                # two button tables
+    if ($p -ne $d.Length) { return $null }
+    return $f
+}
+function Get-Field([byte[]]$d, $f, [string]$k) { return [BitConverter]::ToInt32($d, $f[$k]) }
+function Set-Field([byte[]]$d, $f, [string]$k, [int]$v) { [Array]::Copy([BitConverter]::GetBytes($v), 0, $d, $f[$k], 4) }
+function Write-Options([string]$path, [byte[]]$d) {
+    [Array]::Copy([BitConverter]::GetBytes([uint32](Get-Crc32 $d 4)), 0, $d, 0, 4)
+    [IO.File]::WriteAllBytes($path, $d)
+}
+
+function Read-Recorded {
+    $rec = [ordered]@{}
+    if (Test-Path -LiteralPath $StateSettings) {
+        foreach ($l in Get-Content -LiteralPath $StateSettings) {
+            $i = $l.IndexOf('=')
+            if ($i -gt 0) { $rec[$l.Substring(0, $i)] = $l.Substring($i + 1) }
+        }
+    }
+    return $rec
+}
+# A recorded entry is "original|set".
+function Split-Recorded([string]$v) {
+    $i = $v.IndexOf('|')
+    if ($i -ge 0) { return @([int]$v.Substring(0, $i), [int]$v.Substring($i + 1)) }
+    return @([int]$v, $null)
+}
+
+$Names = @{ 'DisplayMode' = @('Windowed', 'Borderless', 'Fullscreen'); 'Preset' = @('Low', 'Medium', 'High', 'Custom') }
+function Format-Value([string]$k, [int]$v) {
+    if ($Names.ContainsKey($k) -and $v -ge 0 -and $v -lt $Names[$k].Count) { return $Names[$k][$v] }
+    if ($k -in @('MotionBlur', 'DepthOfField')) { if ($v) { return 'On' } else { return 'Off' } }
+    return "$v"
+}
+
+function Restore-Settings([string]$game) {
+    # steam_appid.txt that an older launcher created (it marked it): to the Recycle Bin
+    $marker = Join-Path $game $AppIdMarker
+    if (Test-Path -LiteralPath $marker) {
+        if (Send-ToRecycleBin (Join-Path $game 'steam_appid.txt') $game) { Say 'steam_appid.txt (made by an older version of this mod) -> Recycle Bin' }
+        [void](Send-ToRecycleBin $marker $game)
+    }
+    $rec = Read-Recorded
+    if ($rec.Count -eq 0) { return }
+    $opt = Find-OptionsFile $game
+    if (-not $opt) { Warn 'The game options file was not found - nothing to put back.'; return }
+    $d = [IO.File]::ReadAllBytes($opt)
+    $f = Read-Options $d
+    if (-not $f) {
+        Warn 'The game options file is not in the expected form - left alone (set the options yourself in the game).'
+        return
+    }
+    foreach ($k in $rec.Keys) {
+        if (-not $f.Contains($k)) { continue }
+        $orig, $set = Split-Recorded $rec[$k]
+        $cur = Get-Field $d $f $k
+        if ($null -ne $set -and $cur -eq $set) {  # still what the installer set
+            Set-Field $d $f $k $orig
+            if ($k -notmatch '^Quality') { Say "game options: $k back to $(Format-Value $k $orig)" }
+        } elseif ($k -notmatch '^Quality') {
+            Say "game options: $k left at $(Format-Value $k $cur) (changed by you since)"
+        }
+    }
+    Write-Options $opt $d
+    [void](Send-ToRecycleBin $StateSettings $game)
+    [void](Send-ToRecycleBin $OptionsBackup $game)
+}
+
+# ---- the game's options for VR -----------------------------------------------------------------------------------
+# Display mode Windowed (the square VR picture needs it), motion blur off, depth of field off. The original values
+# are recorded (settings_changed.txt) so the uninstaller puts them back while they are still what this set. Anything
+# that cannot be changed is listed with what to set by hand in the game's options.
+function Set-VrGameSettings([string]$game) {
+    $manual = [ordered]@{ 'DisplayMode' = 'Display mode: Windowed'; 'MotionBlur' = 'Motion blur: Off'; 'DepthOfField' = 'Depth of field: Off' }
+    Write-Host ''
+    Say 'GAME OPTIONS FOR VR'
+    $want = [ordered]@{ 'DisplayMode' = 0; 'MotionBlur' = 0; 'DepthOfField' = 0 }
+    $failed = @()
+    $opt = Find-OptionsFile $game
+    if (-not $opt) {
+        Warn 'The game options file was not found - the game creates it the first time it runs.'
+        Warn '(Or start the game once, close it, and run this installer again.)'
+        $failed = @($want.Keys)
     } else {
-        Say ('{0}: build stamp 0x{1:x8} - not the verified build. The mod finds its game addresses' -f $ExeName, $b.Id.TimeStamp)
-        Say 'by signature when the game starts; anything it cannot find stays off, and if the core VR'
-        Say 'view cannot be found the game simply runs normally on the monitor (see b2svr_logs\b2svr.log).'
+        try {
+            $d = [IO.File]::ReadAllBytes($opt)
+            $f = Read-Options $d
+            if (-not $f) { throw 'the options file is from an unknown version of the game' }
+            if (-not (Test-Path -LiteralPath $OptionsBackup)) { [IO.File]::WriteAllBytes($OptionsBackup, $d) }
+            $preset = Get-Field $d $f 'Preset'
+            if ($preset -ne 3) {
+                if (-not $PresetChoices.ContainsKey($preset)) { throw "unknown graphics preset $preset" }
+                # Custom with exactly the chosen preset's choices: only motion blur and depth of field change
+                for ($q = 1; $q -le 6; $q++) { $want["Quality$q"] = $PresetChoices[$preset][$q - 1] }
+                $want['Preset'] = 3
+            }
+            $rec = Read-Recorded
+            foreach ($k in $want.Keys) {
+                $old = Get-Field $d $f $k
+                Set-Field $d $f $k $want[$k]
+                # the first original is kept (a second install must not record the mod's own values as yours)
+                $orig = $old
+                if ($rec.Contains($k)) { $orig = (Split-Recorded $rec[$k])[0] }
+                $rec[$k] = "$orig|$($want[$k])"
+            }
+            Write-Options $opt $d
+            $out = foreach ($k in $rec.Keys) { "$k=$($rec[$k])" }
+            Set-Content -LiteralPath $StateSettings -Value $out -Encoding ASCII
+            # read back: the file really holds the values now, with a valid checksum
+            $check = [IO.File]::ReadAllBytes($opt)
+            $cf = Read-Options $check
+            if (-not $cf) { throw 'the options file did not read back' }
+            foreach ($k in $want.Keys) { if ((Get-Field $check $cf $k) -ne $want[$k]) { $failed += $k } }
+        } catch {
+            Warn "The game options could not be changed ($($_.Exception.Message))."
+            $failed = @($manual.Keys)
+        }
     }
+    $done = @($manual.Keys | Where-Object { $failed -notcontains $_ })
+    foreach ($k in $done) { Say "game options: $($manual[$k])" }
+    if ($want.Contains('Preset') -and $failed.Count -eq 0) { Say 'game options: Graphics preset Custom (the same quality as before)' }
+    if ($failed.Count -gt 0) {
+        Write-Host ''
+        Warn 'These game options could NOT be changed by the installer.'
+        Warn 'Please set them yourself in the game (Options -> Graphics):'
+        foreach ($k in $failed) { if ($manual.Contains($k)) { Warn "   - $($manual[$k])" } }
+    }
+}
 
-    # dinput8.dll
+# ---- the mod's own starting choices ------------------------------------------------------------------------------
+# Step 1: first person while walking on, first person in cutscenes off. Step 2 (0.18.1): rendering method AFR.
+# Step 3 (1.0.0, owner: "make the mods default rendering native stereo"): rendering method Native. A new
+# b2svr.ini (the release's default) has them already. An existing one gets each step ONCE: the key installer_defaults
+# holds the last step done - from then on the player's own changes stay.
+# The line after the [b2svr] section's last line (the section is added when missing).
+function Get-SectionEnd([System.Collections.Generic.List[string]]$lines) {
+    $section = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[b2svr\]\s*$') { $section = $i; break } }
+    if ($section -lt 0) { $lines.Add('[b2svr]'); $section = $lines.Count - 1 }
+    for ($i = $section + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[') { return $i } }
+    return $lines.Count
+}
+function Set-IniKey([System.Collections.Generic.List[string]]$lines, [string]$key, [string]$value) {
+    $end = Get-SectionEnd $lines
+    $found = $false
+    for ($i = 0; $i -lt $end; $i++) {
+        if ($lines[$i] -match ('^\s*' + [regex]::Escape($key) + '\s*=')) { $lines[$i] = "$key=$value"; $found = $true }
+    }
+    if (-not $found) { $lines.Insert($end, "$key=$value") }
+}
+function Set-VrModDefaults([string]$game) {
+    $ini = Join-Path $game 'b2svr.ini'
+    if (-not (Test-Path -LiteralPath $ini)) {
+        Copy-Item -LiteralPath (Join-Path $Files 'b2svr.ini') -Destination $ini
+        Say 'VR settings: first person while walking on, in cutscenes off (b2svr.ini created)'
+        return
+    }
+    try {
+        $lines = [System.Collections.Generic.List[string]]([System.IO.File]::ReadAllLines($ini))
+        $done = 0
+        foreach ($l in $lines) {
+            if ($l -match '^\s*installer_defaults\s*=\s*([0-9.]+)') { $done = [double]$Matches[1] }
+        }
+        if ($done -ge 3) {
+            Say 'VR settings: your own choices kept'
+            return
+        }
+        while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+        if ($done -lt 1) {
+            Set-IniKey $lines 'firstperson' 'on'
+            Set-IniKey $lines 'fpcutscenes' 'off'
+            Say 'VR settings: first person while walking on, in cutscenes off'
+        }
+        Set-IniKey $lines 'rendering_method' 'native'
+        Say 'VR settings: rendering method Native (both eyes every frame; AFR and Mono are in the VR settings panel)'
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            if ($lines[$i] -match '^\s*installer_defaults\s*=' -or $lines[$i] -match '^; Set once by the installer') { $lines.RemoveAt($i) }
+        }
+        $end = Get-SectionEnd $lines
+        $lines.Insert($end, 'installer_defaults=3')
+        $lines.Insert($end, '; Set once by the installer (first person while walking on, in cutscenes off; rendering method Native) - your own changes are kept.')
+        [System.IO.File]::WriteAllLines($ini, $lines, (New-Object System.Text.UTF8Encoding $false))
+    } catch {
+        Warn "The VR settings (b2svr.ini) could not be changed ($($_.Exception.Message))."
+    }
+}
+
+# =================================================================================================================
+if ($Mode -eq 'Install') {
+    Banner 'BEYOND: TWO SOULS VR MOD  -  INSTALL'
+    $payload = Join-Path $Files 'dinput8.dll'
+    if (-not (Test-Path -LiteralPath $payload)) { Bad 'files\dinput8.dll is missing - unzip the mod again.'; Done 1 }
+    $game = Find-GameDir
+    if (-not $game) { Bad 'No Beyond: Two Souls folder found - nothing was changed.'; Done 1 }
+    Say "Game folder: $game"
+    if (Test-GameRunning) { Warn 'Beyond: Two Souls is running. Close it, then run this again.'; Done 1 }
+    Set-Content -LiteralPath $StateGame -Value $game -Encoding UTF8
+
     $dst = Join-Path $game 'dinput8.dll'
     if (Test-Path -LiteralPath $dst) {
         if (-not (Test-OurDll $dst)) {
             Bad 'There is already a dinput8.dll in the game folder that is NOT this mod'
-            Say '(another mod, an ASI loader or an overlay). It was left alone. Move it somewhere'
-            Say 'else if you want this VR mod instead, then run this again.'
+            Say '(another mod, an ASI loader or an overlay). It was left alone. Move it somewhere else if you want'
+            Say 'this VR mod instead, then run this again.'
             Done 1
         }
         if ((Get-FileHash -LiteralPath $dst).Hash -eq (Get-FileHash -LiteralPath $payload).Hash) {
-            Say 'dinput8.dll: installed and up to date'
+            Say 'dinput8.dll: already installed and up to date'
         } else {
             Copy-Item -LiteralPath $payload -Destination $dst -Force
             Say 'dinput8.dll: updated to this release'
@@ -489,103 +434,68 @@ if ($Mode -eq 'Play') {
         Say 'dinput8.dll: installed'
     }
     try { Unblock-File -LiteralPath $dst } catch { }
-    Set-Content -LiteralPath $StateGame -Value $game -Encoding UTF8
 
-    # steam_appid.txt (Steam copies): lets the exe start directly; never replaces an existing one
-    $sid = Get-SteamAppId $game
-    if ($sid) {
-        $appid = Join-Path $game 'steam_appid.txt'
-        if (-not (Test-Path -LiteralPath $appid)) {
-            Set-Content -LiteralPath $appid -Value $sid -Encoding ASCII -NoNewline
-            Set-Content -LiteralPath (Join-Path $game $AppIdMarker) -Value $sid -Encoding ASCII
-            Say "steam_appid.txt: created (app $sid)"
-        } else {
-            Say 'steam_appid.txt: already present, left alone'
-        }
-    }
-
-    # b2svr.ini - the player's settings are never overwritten
-    $ini = Join-Path $game 'b2svr.ini'
-    if (-not (Test-Path -LiteralPath $ini)) {
-        Copy-Item -LiteralPath (Join-Path $Files 'b2svr.ini') -Destination $ini
-        Say 'b2svr.ini: default VR settings created'
-    } else {
-        Say 'b2svr.ini: your VR settings kept'
-    }
-    Select-VrSettings $ini
+    Set-VrGameSettings $game
+    Set-VrModDefaults $game
 
     Write-Host ''
-    Say 'In the game''s graphics settings: Windowed mode, Motion blur off, Depth of field off.'
-    Write-Host ''
-    Say 'In the game:'
-    Say '  - VR starts by itself a few seconds after the game starts'
-    Say '  - F9 = VR on / off      F2 = recenter the view'
-    Say '  - F1 = first person while playing      F3 = first person in cutscenes'
-    Say '  - more in GUIDE.md'
-    Write-Host ''
-    if ($NoLaunch) { Say 'Installed (-NoLaunch: SteamVR and the game were not started).'; exit 0 }
-    Start-SteamVRIfNeeded
-    Write-Host ''
-    [void](Ask 'Put the headset on, then press Enter to start the game' '')
-    Start-Game $game
-    Say 'The mod stays installed: starting the game from Steam or its exe also runs in VR'
-    Say '(set xr=off in b2svr.ini to start flat and switch with F9). Uninstall with "Uninstall VR mod.cmd".'
-    Start-Sleep -Seconds 4
-    exit 0
+    Say 'Done. From now on just start Beyond: Two Souls as usual (Steam, Epic or the exe)'
+    Say 'with your headset on - VR starts by itself. You never need to run this again'
+    Say '(only after downloading a new version of the mod).'
+    Say 'Uninstall any time with "Uninstall VR mod.cmd" in this folder.'
+    Done 0
 }
 
-# ===================================================================================================
 if ($Mode -eq 'Uninstall') {
     Banner 'BEYOND: TWO SOULS VR MOD  -  UNINSTALL'
     $game = Find-GameDir
-    Add-Scrub $game '<game folder>'
     if (-not $game) { Bad 'No Beyond: Two Souls folder found - nothing was changed.'; Done 1 }
-    $game = Use-GameDir $game
     Say "Game folder: $game"
     Write-Host ''
-    Say 'This will:'
-    Say '  1. remove the mod (dinput8.dll) from the game folder'
-    Say '  2. optionally delete b2svr.ini (your VR settings) and the b2svr_logs folder'
-    Say '  3. delete the mod''s own files from this folder, and the folder once it is empty:'
-    Say "     $ModDir"
-    Say 'Your saves, every game file and anything else you keep in this folder are left alone.'
+    Say 'This will move to the Recycle Bin (nothing is deleted for good):'
+    Say '  - dinput8.dll (the mod) from the game folder'
+    Say '  - if you want: b2svr.ini (your VR settings) and the b2svr_logs folder'
+    Say '  - this B2S_VR_MOD folder'
+    Say 'Game options the installer changed are put back. Your saves, the game''s exe and every'
+    Say 'other game file are left alone.'
     Write-Host ''
-    $a = Ask 'Type YES and press Enter to uninstall (anything else cancels)' 'YES'
+    $a = Read-Host '   Type YES and press Enter to uninstall (anything else cancels)'
     if ($a -ne 'YES' -and $a -ne 'yes') { Say 'Cancelled. Nothing was changed.'; Done 0 }
     if (Test-GameRunning) { Warn 'Beyond: Two Souls is running - close it first, then run this again.'; Done 1 }
     Write-Host ''
 
     $dll = Join-Path $game 'dinput8.dll'
     if (Test-Path -LiteralPath $dll) {
-        if (Test-OurDll $dll) { Remove-Item -LiteralPath $dll -Force; Say 'Removed dinput8.dll (the mod)' }
-        else { Warn 'dinput8.dll in the game folder is not this mod - left alone' }
+        if (Test-OurDll $dll) {
+            if (Send-ToRecycleBin $dll $game) { Say 'dinput8.dll (the mod) -> Recycle Bin' }
+        } else { Warn 'dinput8.dll in the game folder is not this mod - left alone' }
     } else { Say 'dinput8.dll: not installed' }
 
-    $marker = Join-Path $game $AppIdMarker
-    if (Test-Path -LiteralPath $marker) {
-        $appid = Join-Path $game 'steam_appid.txt'
-        if (Test-Path -LiteralPath $appid) { Remove-Item -LiteralPath $appid -Force; Say 'Removed steam_appid.txt (created by this mod)' }
-        Remove-Item -LiteralPath $marker -Force
-    }
+    Restore-Settings $game
 
-    $k = Ask 'Also delete b2svr.ini (your VR settings) and the b2svr_logs folder? Type Y to delete' 'Y'
+    $k = Read-Host '   Also move b2svr.ini (your VR settings) and the b2svr_logs folder to the Recycle Bin? Type Y'
     if ($k -eq 'Y' -or $k -eq 'y') {
-        foreach ($f in $ModDataFiles) {
-            $p = Join-Path $game $f
-            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "Removed $f" }
+        foreach ($f in @('b2svr.ini', 'b2svr_logs', 'b2svr.log', 'b2svr.prev.log', 'b2svr_cmd.txt', 'b2svr_cmd.done',
+                         'b2svr_camdump.bin', 'b2svr_vpdump.bin')) {
+            if (Send-ToRecycleBin (Join-Path $game $f) $game) { Say "$f -> Recycle Bin" }
         }
-        $logs = Join-Path $game 'b2svr_logs'
-        if (Test-Path -LiteralPath $logs) { Remove-Item -LiteralPath $logs -Recurse -Force; Say 'Removed b2svr_logs' }
     } else {
         Say 'b2svr.ini and b2svr_logs kept'
     }
 
+    # this folder: only when it is really the mod's own folder - inside the game folder but not the game folder,
+    # with the mod's files in it and no program file anywhere inside (Send-ToRecycleBin checks the last two again)
+    $modOk = (Test-Path -LiteralPath (Join-Path $ModDir 'tools\b2svr_setup.ps1')) -and
+             (Test-Path -LiteralPath (Join-Path $ModDir 'Uninstall VR mod.cmd')) -and
+             -not (Test-GameDir $ModDir)
     Write-Host ''
-    Say 'Done. Beyond: Two Souls will start normally on your monitor again.'
-    if ($NoLaunch) { Say '(-NoLaunch: this folder is kept)'; exit 0 }
-    $cleanup = Remove-ModFiles $game
-    if ($cleanup) { Say 'The last files go when you close this window.' }
-    [void](Ask 'Press Enter to finish' '')
-    if ($cleanup) { Start-FinalCleanup }
-    exit 0
+    if ($modOk -and (Send-ToRecycleBin $ModDir $game)) {
+        Say "$ModDir -> Recycle Bin"
+    } else {
+        Say "This folder was left where it is: $ModDir"
+        Say 'Delete it yourself if you do not need it any more.'
+    }
+    Write-Host ''
+    Say 'Done. Beyond: Two Souls starts normally on your monitor again.'
+    Done 0
 }

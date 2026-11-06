@@ -7,12 +7,13 @@
 #include <cstring>
 #include <string>
 
+#include "devtools.h"
 #include "crashreport.h"
 #include "game.h"
 #include "log.h"
 #include "probe.h"
 
-#define B2SVR_VERSION "0.17.16"
+#define B2SVR_VERSION "1.0.0"
 
 namespace {
 
@@ -81,6 +82,7 @@ DWORD WINAPI InitThread(LPVOID) {
 
     // RE-03: the first line alone must prove which bytes ran in which process.
     b2s::Log("B2SVR " B2SVR_VERSION " built " __DATE__ " " __TIME__ " dll=%s", Narrow(dllPath).c_str());
+    b2s::Log("build: %s", b2s::devtools::Available() ? "developer (with the maintainer's F7 / F8 tools)" : "release");
     b2s::Log("pid=%lu exe=%s base=%p arch=x64", GetCurrentProcessId(), Narrow(exePath).c_str(),
              GetModuleHandleW(nullptr));
     b2s::crash::Install(B2SVR_VERSION);

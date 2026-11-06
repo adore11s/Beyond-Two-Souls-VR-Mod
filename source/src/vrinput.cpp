@@ -11,6 +11,7 @@
 #include <string>
 #include "game.h"
 #include "log.h"
+#include "panel.h"
 #include "steam_shadow.h"
 
 namespace b2s::vrinput {
@@ -475,19 +476,54 @@ void Suspend() {
     std::lock_guard lock(g_sampleMutex);
     g_sample={}; g_sampleTick=0;
 }
+// The playbook's controller gestures (chapter 28), in the same pass that builds the game's buttons so the
+// presses they use never reach the game.
+FaceChord g_chord;
+bool g_startPulse = false;
+HeadSwitch g_headSwitch;
+uint64_t g_headSwitchAt = 0;  // a switch waiting for fpcam (expires after 1 s)
 void Publish(const xr::FrameInput& frame, bool firstPersonGameplay, float cameraRelativeHeadYaw) {
     std::lock_guard lock(g_sampleMutex);
-    g_sample=SampleFromFrame(frame,GetTickCount64());
+    const uint64_t now = GetTickCount64();
+    g_sample=SampleFromFrame(frame,now);
+    if (g_sample.fresh) {
+        const bool atHead = frame.hand[1].active && frame.hand[1].gripValid &&
+                            HandAtHead(frame.headRel, frame.hand[1].gripRel);
+        if (g_headSwitch.Feed(g_sample, atHead)) {
+            g_headSwitchAt = now;
+            Log("VRINPUT right hand at the head + B / O: first-person switch");
+        }
+        const bool wasPulse = g_startPulse;
+        g_startPulse = g_chord.Feed(g_sample, now);
+        if (g_startPulse && !wasPulse) Log("VRINPUT all four face buttons: Start (pause menu, VR settings)");
+    }
     g_sample.headYaw=cameraRelativeHeadYaw;
     g_sampleTick=frame.tickMs;
     g_gameplay=firstPersonGameplay;
     UpdateMotion(frame);
 }
+bool ConsumeHeadSwitch() {
+    std::lock_guard lock(g_sampleMutex);
+    const bool pending = g_headSwitchAt && GetTickCount64() - g_headSwitchAt <= 1000;
+    g_headSwitchAt = 0;
+    return pending;
+}
 LegacyState Snapshot() {
     std::lock_guard lock(g_sampleMutex);
     const uint64_t now=GetTickCount64();
     if (!xr::Running() || !g_sampleTick || now<g_sampleTick || now-g_sampleTick>250) return {};
-    return Map(g_sample,g_gameplay);
+    LegacyState out = Map(g_sample,g_gameplay);
+    if (g_startPulse && now < g_chord.pulseUntil) out.buttons |= kRightMenu;  // Start (Button case 0)
+    // A controller pointing at the VR settings panel: its trigger clicks the panel, never the game.
+    if (panel::CapturesTrigger(0)) {
+        out.leftTrigger = 0.f;
+        out.buttons &= ~kLeftTriggerButton;
+    }
+    if (panel::CapturesTrigger(1)) {
+        out.rightTrigger = 0.f;
+        out.buttons &= ~kRightTriggerButton;
+    }
+    return out;
 }
 // b2svr.ini next to the game exe: the F10 / F11 choice is kept there (owner: it was forgotten on exit).
 std::wstring IniPath() {

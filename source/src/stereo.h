@@ -41,6 +41,18 @@ void BeforePresent();
 
 // VR requested (b2svr.ini xr=on, F9 or the "xr on" verb), whether or not the session runs yet.
 bool XrWanted();
+// VR on / off as F9 does (applied at the next Present; the VR settings panel's "VR on / off").
+void RequestVr(bool on);
+
+// Rendering method (VR settings panel): Native (both eyes every frame), AFR (one eye per frame, alternating; the
+// default since 0.18.1) or Mono (one picture per frame from the centre of the head, shown to both eyes; playbook
+// 18.7, built on the AFR path), playbook 18. b2svr.ini rendering_method=native|afr|mono, saved by SetMethod
+// (EXP-044 / 045 / 048).
+enum Method { kNative = 0, kAfr = 1, kMono = 2 };
+bool AfrSupported();  // AFR and Mono (Mono is AFR's single pass with a centre camera)
+int GetMethod();
+void SetMethod(int method);
+const char* MethodName(int method);
 
 // devctl verbs: "stereo on|off", "ipd <m>", "suppress on|off", "sshot <name>", "xr on|off", "recenter".
 bool Command(const char* verb, const char* arg);

@@ -16,7 +16,7 @@ ctest --test-dir build -C RelWithDebInfo
 
 This produces `build\RelWithDebInfo\dinput8.dll`. To try it:
 - copy it next to `BeyondTwoSouls_Steam.exe`, or `cmake --build build --config RelWithDebInfo --target deploy` (the game folder is found when `B2S_VR_MOD` sits inside it; otherwise configure with `-DB2S_GAME_DIR=<game folder>`), or
-- put it in `files\` and run `Play Beyond Two Souls in VR.cmd`.
+- put it in `files\` and run `Install VR mod.cmd`.
 
 The `ctest` suites are desk tests of the pose maths, the first-person rules, controller mapping and the Steam Input table; they need neither the game nor a headset.
 
@@ -45,7 +45,7 @@ The `ctest` suites are desk tests of the pose maths, the first-person rules, con
 ### Debugging
 
 - **Log.** Everything the mod does goes to `b2svr_logs\b2svr.log` next to the game's exe (the previous run: `b2svr.prev.log`).
-- **Privacy.** Players send the log, crash reports and `setup_log.txt` with bug reports, so they must never identify them. Every log line passes `LogScrub` (`src/log.cpp`): the game folder and user profile paths, the Windows user name and the computer name are replaced (`<game folder>`, `<user profile>`, `<user>`, `<pc>`); `tests/log_tests.cpp` checks it. The installer does the same for `setup_log.txt`. PC specs (Windows version, CPU, GPU, RAM, headset) are fine; never log account names, IDs, serial numbers or anything outside the game.
+- **Privacy.** Players send the log and crash reports with bug reports, so they must never identify them. Every log line passes `LogScrub` (`src/log.cpp`): the game folder and user profile paths, the Windows user name and the computer name are replaced (`<game folder>`, `<user profile>`, `<user>`, `<pc>`); `tests/log_tests.cpp` checks it. PC specs (Windows version, CPU, GPU, RAM, headset) are fine; never log account names, IDs, serial numbers or anything outside the game.
 - **Commands.** Write lines into `b2svr_cmd.txt` next to the exe while the game runs; they are executed within a few frames. Examples:
   - `xr on` / `xr off`
   - `recenter`
@@ -59,7 +59,8 @@ The `ctest` suites are desk tests of the pose maths, the first-person rules, con
   - Faults inside the game or the mod are logged (first chance) with registers and a stack.
   - A real crash also writes `b2svr_logs\crash_reports\crash_<date>.txt`, the file players send. The game's own crash handler still runs after it.
   - Keep the `dinput8.pdb` of every build you release, so a `dinput8.dll+0x...` offset from a report can be mapped to a function.
-- **Installer.** `tools\b2svr_setup.ps1 -Mode Check` shows what is installed without changing anything; `-NoLaunch -Unattended -GameDir <folder>` runs Play / Uninstall against a test folder without questions or starting anything.
+- **Installer.** `tools\b2svr_setup.ps1 -Mode Install | Uninstall` is what the two `.cmd` files run. Test it on a copy: a folder with a dummy `BeyondTwoSouls_Steam.exe` and this folder inside it, with `USERPROFILE` pointed at a folder holding a copy of `Saved Games\Beyond Two Souls Steam\Save\Options\0` (answers can be piped in for `Read-Host`). The options-file layout it edits is documented at `Read-Options` in the script.
+- **VR settings panel.** `panel_preview` (built with the tests, not run by `ctest`) renders the panel to `panel_preview.bmp` without the game.
 
 ## Guidelines
 
@@ -73,4 +74,4 @@ The `ctest` suites are desk tests of the pose maths, the first-person rules, con
 1. Build `RelWithDebInfo` and run the tests.
 2. Copy `dinput8.dll` into `files\` and update `files\BUILD.txt` (version, SHA-256, date).
 3. Keep that build's `dinput8.pdb` privately (it is not part of the release).
-4. Test `Play Beyond Two Souls in VR.cmd` and `Uninstall VR mod.cmd` on a clean game folder.
+4. Test `Install VR mod.cmd` and `Uninstall VR mod.cmd` on a clean game folder.

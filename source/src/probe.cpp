@@ -16,6 +16,7 @@
 #include <share.h>
 #include <string>
 
+#include "crashreport.h"
 #include "devctl.h"
 #include "game.h"
 #include "log.h"
@@ -641,7 +642,9 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
     sync = pacing::OnPresent(sync, xr::Running());  // under XR the headset (xrWaitFrame) paces
     OnPresent(sc, sync, flags, "PRESENT");
     stereo::BeforePresent();
-    return g_origPresent(sc, sync, flags);
+    const HRESULT hr = g_origPresent(sc, sync, flags);
+    if (FAILED(hr)) crash::NoteDeviceLost("Present", hr, sc);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
@@ -649,7 +652,9 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* sc, UINT sync, UINT flag
     sync = pacing::OnPresent(sync, xr::Running());
     OnPresent(sc, sync, flags, "PRESENT1");
     stereo::BeforePresent();
-    return g_origPresent1(sc, sync, flags, p);
+    const HRESULT hr = g_origPresent1(sc, sync, flags, p);
+    if (FAILED(hr)) crash::NoteDeviceLost("Present1", hr, sc);
+    return hr;
 }
 
 // ---- EXP-003 draw census: where do D3D11 draws happen relative to the list display? ----

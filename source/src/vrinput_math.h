@@ -104,6 +104,62 @@ inline LegacyState Map(const Sample& in, bool gameplay) {
     return out;
 }
 
+// All four face buttons = the game's pause menu, where the VR settings panel is (GoW D-162 / D-237, playbook
+// 28.1): Touch-style and PS VR2 Sense controllers have no Options button on the right hand. Holding A B X Y
+// together (cross circle square triangle) and letting go sends Start for 150 ms (Beyond's Steam action
+// button_start, pad +0x120, read by INPUT_DEVICE_STEAM_PAD::vfunc_06 140c01b70). From the moment all four are
+// down until all four are up no face button reaches the game. Beyond has no second menu VR players need, so
+// holding does nothing extra.
+struct FaceChord {
+    bool on = false;
+    uint64_t pulseUntil = 0;
+    // Edits the sample's face buttons; returns true while Start is to be sent.
+    bool Feed(Sample& s, uint64_t now) {
+        const bool all4 = s.leftA && s.leftB && s.rightA && s.rightB;
+        const bool any = s.leftA || s.leftB || s.rightA || s.rightB;
+        if (all4) on = true;
+        if (on) {
+            if (!any) {
+                on = false;
+                pulseUntil = now + 150;
+            }
+            s.leftA = s.leftB = s.rightA = s.rightB = false;
+        }
+        return now < pulseUntil;
+    }
+};
+
+// Right hand at the head + its upper face button (B / O) switches first person (GoW D-252, playbook 28.2):
+// within `zone` (0.25 m) of the eyes, not more than 0.10 m behind the face plane, between 0.25 m below and
+// 0.10 m above the eyes; the face plane uses the head's yaw-only forward. Positions in the seated reference.
+inline bool HandAtHead(const pose::Mat4& head, const pose::Mat4& grip, float zone = 0.25f) {
+    const float d[3] = {grip.m[12] - head.m[12], grip.m[13] - head.m[13], grip.m[14] - head.m[14]};
+    float fx = -head.m[8], fz = -head.m[10];
+    const float fn = std::sqrt(fx * fx + fz * fz);
+    if (!(fn > 1e-3f)) return false;
+    fx /= fn;
+    fz /= fn;
+    const float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    const float behind = -(d[0] * fx + d[2] * fz), up = d[1];
+    return dist < zone && behind < 0.10f && up > -0.25f && up < 0.10f;
+}
+// The press that switches never reaches the game (no action from the B button) until the button is released.
+struct HeadSwitch {
+    bool down = false, consumed = false;
+    // Returns true on the press that switches; clears the sample's right B while that press is held.
+    bool Feed(Sample& s, bool atHead) {
+        bool fire = false;
+        if (s.rightB && !down && atHead) {
+            fire = true;
+            consumed = true;
+        }
+        down = s.rightB;
+        if (!s.rightB) consumed = false;
+        if (consumed) s.rightB = false;
+        return fire;
+    }
+};
+
 inline Sample SampleFromFrame(const xr::FrameInput& frame, uint64_t now) {
     Sample out{};
     if (!xr::FrameInputUsable(frame, now)) return out;

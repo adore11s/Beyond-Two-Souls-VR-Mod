@@ -1,6 +1,6 @@
 Beyond: Two Souls VR mod - build information
-version:  0.17.16
-dinput8.dll sha256: 0C49F446B54E55006D98CF7B1F43C41FF6357FEFB36DABBB33F35080DC4E7CC0
-built:    2026-10-18 19:27 (RelWithDebInfo)
+version:  1.0.0
+dinput8.dll sha256: CF75F72A4AFBE12BD1EFF457969D626DB3110220BC517ABC57542A396EC60DB6
+built:    2026-11-06 14:23 (RelWithDebInfo)
 game:     verified on BeyondTwoSouls_Steam.exe (PE stamp 0x5eb531da, image size 0x2120000);
           other builds (Epic Games Store, other updates): game addresses found by signature

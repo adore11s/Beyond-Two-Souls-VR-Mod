@@ -43,6 +43,9 @@ void* EntityNode(void* scriptEntity) {
     return link ? game::Read<void*>(link, 0x30) : nullptr;
 }
 
+void* EntityModelHandle(void* scriptEntity) { return scriptEntity ? game::Read<void*>(scriptEntity, 0x300) : nullptr; }
+void* EntityModel(void* scriptEntity) { return ResolveCached21(EntityModelHandle(scriptEntity)); }
+
 const float* BoneWorld(void* node, uint32_t nameHash) {
     if (!node || !g_boneByHash) return nullptr;
     void* skel = game::Read<void*>(node, 0x170);

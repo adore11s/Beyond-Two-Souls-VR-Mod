@@ -53,4 +53,37 @@ int main(){
  Vec3 pt=ArmPole(1.5707963f,true); ck(near(pt.z,pr.x,1e-3f)||near(pt.z,-pr.x,1e-3f),"elbow pole turns with the body");
  Mat4 r0=FromPose(YawQuat(0),{0,0,0}); ck(PlausibleStandingHead(FromPose(YawQuat(0),{.05f,1.5f,-.05f}),r0),"standing head accepted");
  ck(!PlausibleStandingHead(FromPose(YawQuat(0),{0,.5f,0}),r0)&&!PlausibleStandingHead(FromPose(YawQuat(0),{.8f,1.5f,0}),r0),"crouched or displaced head rejected");
+ // Drawn-hand filter (playbook 08.1): the first sample passes; at rest alpha ~0.173 at 90 Hz; the same sample
+ // twice changes nothing; a fast move follows closely; the rotation stays orthonormal; a recenter resets.
+ { HandFilter hf; const int64_t f90=11111111; Mat4 a=FromPose(YawQuat(0),{0,1,0});
+   Mat4 o=hf.Feed(a,1000,0); ck(near(o.m[13],1),"hand filter: first sample passes");
+   Mat4 step=FromPose(YawQuat(0),{0,1.001f,0}); o=hf.Feed(step,1000+f90,0); ck(near(o.m[13],1.f+.001f*.1828f,2e-5f),"hand filter: small move, low alpha");
+   Mat4 again=hf.Feed(FromPose(YawQuat(0),{0,2,0}),1000+f90,0); ck(near(again.m[13],o.m[13]),"hand filter: same sample time, no update");
+   Mat4 fast=FromPose(YawQuat(0),{0,1.05f,0}); o=hf.Feed(fast,1000+2*f90,0); ck(o.m[13]>1.03f,"hand filter: fast move follows");
+   Mat4 rot=FromPose(YawQuat(.6f),{0,1.05f,0}); o=hf.Feed(rot,1000+3*f90,0);
+   Vec3 x{o.m[0],o.m[1],o.m[2]},y{o.m[4],o.m[5],o.m[6]},z{o.m[8],o.m[9],o.m[10]};
+   ck(near(Len(x),1)&&near(Len(y),1)&&near(Len(z),1)&&near(Dot(x,y),0)&&near(Dot(x,z),0),"hand filter: rotation orthonormal");
+   o=hf.Feed(FromPose(YawQuat(0),{5,1,0}),1000+4*f90,1); ck(near(o.m[12],5),"hand filter: recenter restarts from the raw grip");
+   o=hf.Feed(FromPose(YawQuat(0),{0,1,0}),1000+4*f90+300000000,1); ck(near(o.m[12],0),"hand filter: a gap over 0.1 s restarts"); }
+ ck(HeadsetFamily("PlayStation VR2")==0&&HeadsetFamily("SteamVR/OpenXR : psvr2")==0,"headset family: PS VR2");
+ ck(HeadsetFamily("Oculus Quest2")==1&&HeadsetFamily("Meta Quest 3")==1&&HeadsetFamily("VirtualDesktopXR (Quest Pro)")==1,"headset family: Quest");
+ ck(HeadsetFamily("Valve Index")==2&&HeadsetFamily("")==2&&HeadsetFamily(nullptr)==2,"headset family: other");
+ { // EXP-059: owner 0.24.0 log, 2003 Navajo Day 2 - stand (2255 s), ride (2283 s), dismount cutscene, walk (2366 s).
+   Mat4 ground=FromPose(YawQuat(0),{0,0,0}), stand=FromPose(YawQuat(0),{0,1.55f,0}), rider=FromPose(YawQuat(0),{0,2.30f,0});
+   StableEye single;  // 0.24.0: one eye per body, relearned on the horse after a base jump
+   for(int i=0;i<30;++i) single.Sample(7,stand,ground);
+   single.Reset(7); for(int i=0;i<30;++i) single.Sample(7,rider,ground);
+   ck(near(single.Eye(ground).m[13]-stand.m[13],.75f),"riding: one eye keeps the ride's height on foot (the 0.24.0 bug, headDy +0.75)");
+   MountedEyes m; m.Reset(7);
+   ck(!m.Update(7,true,0)&&!m.Riding(),"riding: on foot while her motion kit is not synced");
+   for(int i=0;i<30;++i) m.Active().Sample(7,stand,ground);
+   ck(m.Update(7,true,0xA0)&&m.Riding()&&!m.Active().HasSample(),"riding: synced to the horse's graph -> a fresh ride eye");
+   for(int i=0;i<30;++i) m.Active().Sample(7,rider,ground);
+   ck(near(m.Active().Eye(ground).m[13],2.30f),"riding: the view at her head on the horse");
+   ck(!m.Update(7,false,0)&&m.Riding(),"riding: no motion kit (dismount cutscene) keeps the last state");
+   ck(m.Update(7,true,0)&&!m.Riding()&&m.Active().Ready(),"riding: unsynced -> on foot, eye kept from before the ride");
+   ck(near(m.Active().Eye(ground).m[13],1.55f),"riding: after the dismount the view is at her standing head (headDy 0)");
+   m.Update(7,true,0xA0); ck(m.Active().Ready()&&near(m.Active().Eye(ground).m[13],2.30f),"riding: the same horse again keeps its eye");
+   m.Update(7,true,0); m.Update(7,true,0xB0); ck(m.Riding()&&!m.Active().HasSample(),"riding: another horse learns its own eye");
+   m.Reset(8); ck(!m.Riding()&&!m.Foot().HasSample()&&!m.Ride().HasSample(),"riding: a new body clears both eyes"); }
  std::printf("%s (%d failed)\n",fails?"FAILED":"ALL PASS",fails); return fails?1:0; }

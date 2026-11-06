@@ -50,6 +50,8 @@ inline bool FrameInputUsable(const FrameInput& input, uint64_t now) {
 // every 5 s (docs/RECOVERY_MATRIX.md).
 void Service(ID3D11Device* device, bool wanted);
 bool Running();
+// The runtime's recommended eye image size (the larger of the two eyes) from the last start; false before.
+bool RecommendedEyeSize(uint32_t* w, uint32_t* h);
 // Diagnostic: true while the left eye image is dark (and 0.3 s after), for the first 6 dark spells.
 bool DarkTraceActive();
 // True while the left eye image is darker than 3% (read back one or two frames late).
@@ -65,9 +67,25 @@ uint64_t FramesEnded();
 // Optional input is always overwritten, including a neutral snapshot on an early exit.
 int BeginGameFrame(EyeView eyes[2], FrameInput* input = nullptr);
 
+// AFR (alternate frame rendering, playbook 18): one eye per game frame. Game thread, after BeginGameFrame:
+// CanKeepEye says whether the other eye's swapchain holds a recent image (drawn under 100 ms ago, same recenter
+// generation, same session); SetSingleEye marks the slot's pair as drawing only `eye` (-1 = both). The kept eye
+// is submitted with the image it last released and the pose / frustum it was drawn for.
+bool CanKeepEye(int eye);
+void SetSingleEye(int slot, int eye);
+// Render thread: the slot's only eye, or -1 when the pair draws both.
+int SingleEye(int slot);
+// Mono (playbook 18.7): one picture per game frame from the centre of the head, shown to both eyes. SetMono decides
+// for the next BeginGameFrame: both of its eyes are then the head centre (midpoint of the eyes, their mean
+// orientation) with a frustum covering both eyes. The pair draws eye 0 only (SetSingleEye(slot, 0)); OnEye crops that
+// one picture into both eyes' images, each to its own frustum, and both go out with the centre pose.
+void SetMono(bool on);
+bool IsMono(int slot);
+
 // Render thread, at each eye marker. src is the full backbuffer-sized eye image;
 // the scene occupies rows [srcTop, srcTop + srcHeight).
-// uiFollows: the frame is ended by OnUiEnd (UI quad) instead of after eye 1.
+// uiFollows: the frame is ended by OnUiEnd (UI quad) instead of after the pair's last eye (eye 1, or the
+// only eye of an AFR pair, which also begins the frame).
 void OnEye(int eye, int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, uint32_t srcTop,
            uint32_t srcHeight, bool uiFollows);
 

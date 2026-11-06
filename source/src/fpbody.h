@@ -66,6 +66,9 @@ struct Status {
 };
 
 bool Install();
+// Who a skeleton belongs to (EXP-046): a bodykind::Family value and the evidence, before it is watched.
+// Young-Jodie rules apply to the JHO9 family only (or, family unknown, to arms up to 0.42 m).
+void Identify(void* skeleton, int family, const char* why);
 // Game thread, whenever Jodie's node/skeleton are known: her clean head/root are captured
 // for the camera at each final animation build from then on.
 void Watch(void* node, void* skeleton);
@@ -97,6 +100,23 @@ void Suspend();
 void SetRestoreAtPublish(bool on);
 // Dev: turn all skeleton edits on/off (camera first person keeps working).
 void SetEdits(bool on);
+// Dev (EXP-056): fpclothpose one|old = every cloth input gets the one physics pose on named rigs / the earlier mix;
+// fpclothjump on|off = the engine's cloth teleport when the first-person pose jumps.
+void SetClothOnePose(bool on);
+void SetClothTeleports(bool on);
+// Dev (0.26.0): fpheadcloth on|off = her cloth hanging from a hidden head bone (hair) is hidden with her head.
+void SetHeadCloth(bool on);
+// Her head / face / teeth / hair in first person (b2svr.ini fp_head): 0 = shown (0.23.0, for mirror reflections),
+// 1 = hidden in all first person, 2 = hidden while first person is a cutscene (F3), shown in F1 gameplay (0.24.0
+// default, owner 2026-11-05: "hide the head in first person cutscenes, keep it as it is in first person gameplay").
+// Hidden, the head set collapses onto the neck (with everything attached to those bones: hair pieces on M_Head).
+enum HeadMode : int { kHeadShown = 0, kHeadHidden = 1, kHeadHiddenInCutscenes = 2 };
+void SetHeadMode(int mode);
+int GetHeadMode();
+const char* HeadModeName(int mode);
+// 0.24.0 dev A/B (fpitemcull on|off): her items dropped by the engine's visibility where the animation holds them are
+// tested again where they are drawn.
+void SetItemCull(bool on);
 // Dev (fpelems): log every drawable element within 2 m of Jodie for one frame.
 void DumpElements();
 // Dev (fpwatch): addresses of the head bone's translation in both world arrays (+0x10, +0x18).

@@ -13,6 +13,7 @@
 #include <share.h>
 #include <string>
 
+#include "audio.h"
 #include "crashreport.h"
 #include "game.h"
 #include "fpcam.h"
@@ -22,6 +23,7 @@
 #include "probe.h"
 #include "rendersize.h"
 #include "stereo.h"
+#include "devtools.h"
 
 namespace b2s::devctl {
 namespace {
@@ -148,7 +150,7 @@ void Execute(const std::string& line, IDXGISwapChain* sc) {
     } else if (v == "log") {
         Log("DEVCTL mark: %s", line.c_str() + 4);
     } else if (!stereo::Command(verb, arg) && !fpcam::Command(verb, arg) && !zonefix::Command(verb, arg) && !pacing::Command(verb, arg) && !probe::Command(verb, arg) &&
-               !rendersize::Command(verb, arg)) {
+               !rendersize::Command(verb, arg) && !audio::Command(verb, arg) && !devtools::Command(verb, arg)) {
         Log("DEVCTL unknown command '%s'", line.c_str());
     }
 }

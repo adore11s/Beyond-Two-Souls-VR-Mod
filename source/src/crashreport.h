@@ -2,6 +2,7 @@
 #include <cstdint>
 
 struct ID3D11Device;
+struct IDXGISwapChain;
 
 // Crash reports for players to send: when the game really crashes (an unhandled exception), a
 // text file b2svr_logs\crash_reports\crash_<date>.txt is written before the game's own crash
@@ -18,6 +19,11 @@ void Install(const char* modVersion);
 void InstallLate(const char* textSha256, bool supportedBuild);
 // The GPU and its driver, for the report (called once the game's device exists).
 void NoteDevice(ID3D11Device* dev);
+// EXP-057: Present / ResizeBuffers returned a device-lost error (DXGI_ERROR_DEVICE_REMOVED / HUNG / RESET): log the
+// device's removed reason once and name it in a later crash report (the game crashes on its own right after).
+void NoteDeviceLost(const char* where, long hr, IDXGISwapChain* sc);
+// The level for the report (1.0.0): Jodie's character name ("_2101_MEET_MOM_PARK_Jodie") and which Jodie it is.
+void NoteLevel(const char* character, const char* who);
 // Dev command "crashreport": writes a sample report without crashing.
 void WriteTestReport();
 

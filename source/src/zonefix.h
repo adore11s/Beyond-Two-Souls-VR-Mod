@@ -10,14 +10,24 @@
 
 namespace b2s::zonefix {
 
+// 0.24.0: resolves the engine's point -> room lookup (FUN_14092e2b0) and hooks the room query (FUN_1409d9ca0) for the
+// all-rooms case. Call once with the other render hooks.
+void Install();
+// Every 30 s with the other statistics.
+void LogStats();
+
 // Game thread, once per frame (after player / first-person state is known).
 void Frame();
 
 // Game thread, around each eye pass of the drawn list: the stereo cameras' room is set to the room the
-// eye is in for the pass, then put back.
+// engine puts the eye in for the pass, then put back; with the eye between room volumes the pass's room queries see
+// every room instead (0.24.0).
 void BeginPass(void* const* cams, int count);
 void EndPass();
 
 bool Command(const char* verb, const char* arg);
+
+// Diagnostic (any thread): first person is drawn and the eye passes start from another room than the game camera's.
+bool EyeRoomDiffers();
 
 }  // namespace b2s::zonefix

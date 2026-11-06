@@ -1,4 +1,5 @@
 #include "../src/fpbody.h"
+#include "../src/bodykind.h"
 #include <cmath>
 #include <cstdio>
 
@@ -109,6 +110,33 @@ int main() {
         Check(!hide[0]&&!hide[1]&&!hide[22], "hips, spine and secondary group root kept");
         Check(!hide[7]&&!hide[8]&&!hide[9], "arm and fingers never hidden");
         Check(n==8, "exactly the head, neck, face, hair and collar bones");
+    }
+    {   // EXP-046: Jodie's model families (bodykind.h) and when the young-Jodie rules apply.
+        using bodykind::Family;
+        Check(bodykind::FromModelName("IW_JHO9_INT2")==Family::Child, "JHO9 is young Jodie");
+        Check(bodykind::FromModelName("IW_JHO9_PAJ1RIP_IW_JHO9_PAJ1RIP_SKLRAGD")==Family::Child, "JHO9 sub-object");
+        Check(bodykind::FromModelName("IW_JHO14_BS")==Family::Teen && bodykind::FromModelName("IW_JHO16_KRAV_B")==Family::Teen,
+              "JHO14 / JHO16 are the teenager");
+        Check(bodykind::FromModelName("IW_JHO20_PRO")==Family::Adult && bodykind::FromModelName("IW_JHOWITHBIKE")==Family::Adult &&
+              bodykind::FromModelName("IW_JHOB")==Family::Adult, "JHO20, JHOWITHBIKE, JHOB are adult");
+        Check(bodykind::FromModelName("IW_JHO2020_HUN")==Family::Adult, "JHO2020 materials read as 20");
+        Check(bodykind::FromModelName("IW_PBINTM03")==Family::Unknown && bodykind::FromModelName(nullptr)==Family::Unknown,
+              "other models are unknown");
+        Check(bodykind::SceneOf("_0102_PROLOGUE_ARRESTED_Jodie")==102 && bodykind::SceneOf("_0401_JODIE_AND_ANAEL_Jodie")==401,
+              "scene from the character name");
+        Check(bodykind::SceneOf("MENU_GAME_Jodie")==-1 && bodykind::SceneOf("_04x1_A")==-1, "no scene");
+        Check(bodykind::FromScene(102)==Family::Adult && bodykind::FromScene(401)==Family::Child &&
+              bodykind::FromScene(503)==Family::Child && bodykind::FromScene(705)==Family::Child, "adult prologue, child chapters");
+        Check(bodykind::FromScene(801)==Family::Teen && bodykind::FromScene(901)==Family::Teen &&
+              bodykind::FromScene(1209)==Family::Teen && bodykind::FromScene(4001)==Family::Teen, "teen chapters and the DLC");
+        Check(bodykind::FromScene(1401)==Family::Adult && bodykind::FromScene(2408)==Family::Adult, "adult chapters");
+        Check(bodykind::FromScene(2502)==Family::Unknown && bodykind::FromScene(-1)==Family::Unknown,
+              "Black Sun holds every family: unknown");
+        Check(bodykind::ChildRules(Family::Child,0.50f) && !bodykind::ChildRules(Family::Teen,0.38f) &&
+              !bodykind::ChildRules(Family::Adult,0.30f) && !bodykind::ChildRules(Family::Other,0.30f),
+              "the family decides when known");
+        Check(bodykind::ChildRules(Family::Unknown,0.34f) && !bodykind::ChildRules(Family::Unknown,0.48f),
+              "unknown family: the 0.42 m arm rule (young Jodie 0.34, adult 0.48)");
     }
     std::printf("fpbody tests: %d failure(s)\n",failures);
     return failures?1:0;
