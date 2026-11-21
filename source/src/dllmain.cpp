@@ -13,7 +13,7 @@
 #include "log.h"
 #include "probe.h"
 
-#define B2SVR_VERSION "1.0.3"
+#define B2SVR_VERSION "1.1.0"
 
 namespace {
 
