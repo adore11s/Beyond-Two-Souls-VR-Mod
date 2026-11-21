@@ -11,22 +11,25 @@ Play **Beyond: Two Souls (PC)** in VR. Every frame is drawn in true 3D for each 
 - **First person on / off:** hold your right hand next to your head and press **B / ○**. Press it while you walk as Jodie to switch first person for walking, or during a cutscene to switch it for cutscenes. By default it is on for walking and off for cutscenes. You can also change both in the VR settings panel.
 - **Recommended:** play with first person for walking and switch on first person in cutscenes only from time to time. The game was not made for first person, so not every cutscene animation looks good through Jodie's eyes.
 - **Menus:** press **all four face buttons** (A B X Y / ✕ ○ □ △) together and let go for the game's pause menu. The menu button works too.
-- **VR settings:** in the game's pause menu, a panel appears on the right. Point a controller at it and pull the trigger.
+- **VR settings:** in the game's pause menu, and in the main menu's **Options**, a panel appears on the right. Point a controller at it and pull the trigger.
+- **First start:** a few short welcome windows appear once. Close each with a controller's trigger, **Enter** or a gamepad's **A / ✕**.
 
 ## What the mod does
 
 - **Native stereo rendering.** The game is drawn separately for each eye, with full head tracking.
 - **Two ways to play.** Keep the game's **own cameras**, drawn in 3D around you, or play in **first person** through Jodie's eyes: while you walk her and in cutscenes. Whether you walk her or the game animates her is read from the game itself.
-- **Motion controls in first person.** Your VR controllers are Jodie's hands: her arms, wrists and fingers follow them, and whatever she holds stays in her hand. Her body turns with you and the left stick walks where you look.
+- **Motion controls in first person.** Your VR controllers are Jodie's hands: her arms and wrists follow them, her fingers close with your grip and trigger (point and fist on controllers with finger touch; her thumb closes with your grip), and whatever she holds stays in her hand, held the way the game animates it. Her body turns with you and the left stick walks where you look.
 - **Xbox or PlayStation controls**, with matching button icons in the game (VR settings panel).
 - **Rendering method:** Native (both eyes every frame, the default), AFR (one eye per frame, lighter on the graphics card) or Mono (one picture for both eyes, the fastest), set in the VR settings panel.
+- **Camera closer (third person):** moves the game's camera toward the characters (up to 2 m) so it stays inside the room more often. VR settings panel.
+- **Desktop window:** while you play in VR the game's window on your monitor is a 1280 x 720 window you can resize, maximize or snap; it stays 16:9 and remembers your size.
 
 ## Install
 
 1. Start the game normally once and quit it (so it has made its options file).
 2. Open your Beyond: Two Souls folder. In Steam: right-click the game → **Manage** → **Browse local files**. In the Epic Games Launcher: the game's **⋯** menu → **Manage** → the folder icon.
 3. Copy this whole **`B2S_VR_MOD`** folder into it.
-4. Double-click **`Install VR mod.cmd`** in the `B2S_VR_MOD` folder. You only do this **once** (and again after downloading a new version).
+4. Double-click **`Install VR mod.cmd`** in the `B2S_VR_MOD` folder. You only do this **once** (and again after downloading a new version). The window closes by itself when everything went fine.
 5. From now on, start **SteamVR**, put your headset on and start the game as usual, from Steam, Epic or the exe.
 
 VR turns on by itself a few seconds after the game starts. Using Virtual Desktop (**VDXR**) or another OpenXR runtime instead? Connect your headset to it first. The mod's settings file (`b2svr.ini`) sits next to the game's exe.
@@ -43,7 +46,7 @@ VR turns on by itself a few seconds after the game starts. Using Virtual Desktop
 
 ## Uninstall
 
-Double-click **`Uninstall VR mod.cmd`** in the `B2S_VR_MOD` folder. It moves the mod's own files to the **Recycle Bin** (nothing is deleted for good) and puts back the game options the installer changed, unless you changed them yourself since. **Your saves and the game's files are never touched.**
+Double-click **`Uninstall VR mod.cmd`** in the `B2S_VR_MOD` folder, type **YES** and press Enter, then press **Y** or **N** (also remove your VR settings and logs?). It moves the mod's own files to the **Recycle Bin** (nothing is deleted for good) and puts back the game options the installer changed, unless you changed them yourself since. **Your saves and the game's files are never touched.**
 
 ## Something went wrong?
 
@@ -68,6 +71,6 @@ None of these files contain your user name or other personal information.
 
 The mod is free and open source under the **MIT license**. The full source code is in the [`source`](source) folder.
 Anyone can fix, improve or build on it: see **[CONTRIBUTING.md](CONTRIBUTING.md)**.
-The mod includes the official OpenXR loader and MinHook: see **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
+The mod includes the official OpenXR loader, MinHook and the Montserrat font: see **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
 
 *Not affiliated with Quantic Dream or Sony Interactive Entertainment. No game files are included.*

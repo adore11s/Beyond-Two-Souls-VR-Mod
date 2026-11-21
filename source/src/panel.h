@@ -1,10 +1,10 @@
 #pragma once
-// VR settings panel, profile B2S_ELEVEN_ROW_V2 = GOW_STYLE_TEN_ROW_V4 (playbook chapter 2, revision 6: the GoW
-// panel's GDI renderer, layout, fonts and pointing; Beyond has no status meters, so the ten-row profile) plus the row
-// "Aiden possessions (first person)" (EXP-046); V2: "Rendering method" Native | AFR | Mono (EXP-048). Drawn with GDI into a 1000 x 1690
-// DIB (redrawn only when a value or the hovered button changes) and shown by xr.cpp as its own quad, 0.15 m to
-// the right of the floating game screen, on the game's 2D-only screens (the pause menu). Point
-// with either controller and pull its trigger; every choice is saved in b2svr.ini at once.
+// VR settings panel, profile B2S_ELEVEN_ROW_V6 (1.0.3; panel_math.h): the GoW panel's GDI renderer, layout, fonts and
+// pointing in the playbook's V6 style (revision 20/23) with the B2S light-blue accent. Drawn with GDI into a 1000 x 1690
+// DIB (redrawn only when a value or the hovered button changes) and shown by xr.cpp as its own quad, 0.15 m to the right
+// of the floating game screen: on the game's 2D-only screens (the pause menu) and, at the main menu (a 3D scene), while
+// its Options page is open (menuwatch.h, playbook 10.6). Point with either controller and pull its trigger; every
+// choice is saved in b2svr.ini at once.
 #include <cstdint>
 
 #include "panel_math.h"

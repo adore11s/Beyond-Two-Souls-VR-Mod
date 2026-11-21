@@ -1,9 +1,12 @@
 #include "fpbody.h"
 #include "bodykind.h"
 #include "bones.h"
+#include "carry.h"
+#include "fingers.h"
 #include "fpmode.h"
 #include "game.h"
 #include "log.h"
+#include "player.h"
 #include "rigmap.h"
 #include <windows.h>
 #include <intrin.h>
@@ -47,6 +50,7 @@ const uint32_t kUpperHash[2] = {bones::Crc32("L_Arm"), bones::Crc32("R_Arm")};  
 // LIVE (young Jodie): constraint copies parented to M_Hips that follow their driver bone. The
 // fingers hang under LC_*_Hand and the face under LC_M_Head, not under the hand / head bones.
 const uint32_t kLcHandHash[2] = {bones::Crc32("LC_L_Hand"), bones::Crc32("LC_R_Hand")};
+const uint32_t kSocketHash[2] = {bones::Crc32("EA_L_ATTACH01"), bones::Crc32("EA_R_ATTACH01")};  // EXP-064
 const uint32_t kLcHeadHash = bones::Crc32("LC_M_Head");
 const uint32_t kEyeHash[2] = {bones::Crc32("FA_L_Eye"), bones::Crc32("FA_R_Eye")};  // LIVE: face rig bones
 
@@ -102,6 +106,7 @@ struct Rig {
     std::array<bool, detail::kMaxBones> clothKeep{};  // adult: hidden bones left in place in the cloth pose
     std::array<uint32_t, detail::kMaxBones> parents{};
     std::array<bool, detail::kMaxBones> hideTree{};
+    std::array<bool, detail::kMaxBones> notHead{};  // EXP-063: skin helpers of a body bone outside the head, never hidden
     std::array<bool, detail::kMaxBones> carried[2]{};  // bones that follow each solved hand
     // Finger pose frozen relative to the hand (owner: the hand on the controller still played the
     // animation): carried bone = fingerRel * hand, captured once per rig.
@@ -139,6 +144,15 @@ struct Rig {
     bool nameRules = false;
     std::array<uint32_t, detail::kMaxBones> crc{};  // her bone name hashes (+0x270), for hierarchy-mapped objects
     std::array<bool, detail::kMaxBones> handSide[2]{};  // bones of each hand (hand subtree and its copy groups)
+    // EXP-067 (playbook 14.12): the finger chains by the game's names (PX_<S>_Hand*), the rig's rest locals (bind pose,
+    // +0x300) and rest worlds (for the skin check). Every rig, young Jodie included (owner 2026-11-17: "Yes, young Jodie
+    // too").
+    fingers::Hand fhand[2];
+    std::array<bool, detail::kMaxBones> fingerChain[2]{};
+    std::array<Mat4, detail::kMaxBones> restLocal{}, restWorld{};
+    std::array<bool, detail::kMaxBones> restOk{};
+    bool restRead = false, restWorldRead = false, restChecked = false;
+    uint32_t restChecks = 0;
     bool valid = false;
 } g_rig;
 // EXP-056: the rigid transform the drawn body got this frame (turn about the eye pivot plus the head-follow shift):
@@ -218,6 +232,41 @@ uint32_t HashIndex(void* skel, uint32_t count, uint32_t hash) {
             if (*reinterpret_cast<const uint32_t*>(table + size_t(i) * 8) == hash) return i;
         return kAbsent;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return kAbsent; }
+}
+
+// EXP-063: the hierarchy's class word per bone (the +0x270 table's second dword: 1 body, 2 face, 4 fingers, 8 sockets,
+// 16 helpers, +32 copy bone; STATIC FUN_14097d5c0) and its bind-pose locals (+0x300, STATIC FUN_140979af0 reads each
+// bone's matrix there and copies it to the current locals at +0x08).
+bool ReadRestRaw(void* skel, uint32_t count, uint32_t* flags, Mat4* locals) {
+    __try {
+        const uint8_t* table = skel ? *reinterpret_cast<uint8_t**>(static_cast<char*>(skel) + 0x270) : nullptr;
+        const Mat4* rest = skel ? *reinterpret_cast<Mat4**>(static_cast<char*>(skel) + 0x300) : nullptr;
+        if (!table || !rest || count > detail::kMaxBones) return false;
+        for (uint32_t i = 0; i < count; ++i) flags[i] = *reinterpret_cast<const uint32_t*>(table + size_t(i) * 8 + 4);
+        std::memcpy(locals, rest, size_t(count) * sizeof(Mat4));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Bind-pose world matrices in model space (world = local x parent world, the engine's order). false when the
+// hierarchy does not resolve.
+bool RestWorlds(void* skel, uint32_t count, const uint32_t* parents, uint32_t* flags, Mat4* world) {
+    static std::array<Mat4, detail::kMaxBones> locals;
+    static std::array<bool, detail::kMaxBones> done;
+    if (!ReadRestRaw(skel, count, flags, locals.data())) return false;
+    for (uint32_t i = 0; i < count; ++i) done[i] = false;
+    uint32_t left = count;
+    for (uint32_t pass = 0; pass < count && left; ++pass)
+        for (uint32_t i = 0; i < count; ++i) {
+            if (done[i]) continue;
+            const uint32_t par = parents[i];
+            if (par < count && !done[par]) continue;
+            world[i] = par < count ? pose::Mul(locals[i], world[par]) : locals[i];
+            for (float f : world[i].m)
+                if (!std::isfinite(f)) return false;
+            done[i] = true;
+            --left;
+        }
+    return left == 0;
 }
 
 uint32_t BoneCrc(void* skel, uint32_t bone) {
@@ -322,6 +371,53 @@ void BuildHand(Rig& r, const Mat4* w, unsigned h) {
     r.hand[h] = hr;
 }
 
+// EXP-067 (playbook 14.6 / 14.12): the finger chains of both hands by the game's own names (all 272 character rigs with
+// finger bones: PX_<S>_Hand<F>0..3 for Index / Middle / Ring / Pinky, PX_<S>_HandThumb1..3, hanging from LC_<S>_Hand),
+// and the rest shape: the rig's bind-pose locals (+0x300, the NODEAR rest pose the skinned mesh is stored in).
+void BuildFingers(Rig& r) {
+    static const char* const kName[fingers::kCount] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
+    static std::array<uint32_t, detail::kMaxBones> flags;
+    r.restRead = ReadRestRaw(r.skeleton, r.count, flags.data(), r.restLocal.data());
+    r.restWorldRead = RestWorlds(r.skeleton, r.count, r.parents.data(), flags.data(), r.restWorld.data());
+    r.restChecked = false;
+    r.restChecks = 0;
+    uint32_t usable = 0;
+    for (uint32_t b = 0; b < r.count; ++b) {
+        r.restOk[b] = r.restRead && fingers::UsableRest(r.restLocal[b]);
+        usable += r.restOk[b];
+    }
+    for (unsigned h = 0; h < 2; ++h) {
+        r.fhand[h] = fingers::Hand{};
+        r.fingerChain[h].fill(false);
+        uint32_t chains[fingers::kCount][4];
+        for (int f = 0; f < fingers::kCount; ++f)
+            for (int k = 0; k < 4; ++k) {
+                char name[48];
+                if (f == fingers::kThumb) sprintf_s(name, "PX_%c_HandThumb%d", h ? 'R' : 'L', k + 1);
+                else sprintf_s(name, "PX_%c_Hand%s%d", h ? 'R' : 'L', kName[f], k);
+                chains[f][k] = (f == fingers::kThumb && k == 3) ? fingers::kNone
+                                                                : HashIndex(r.skeleton, r.count, bones::Crc32(name));
+            }
+        const uint32_t middle0 = chains[fingers::kMiddle][0];
+        const uint32_t root = middle0 < r.count ? r.parents[middle0] : kAbsent;
+        // The chains must hang from the hand or from its finger copy group (LC_<S>_Hand), on the hand's side.
+        const bool rootOk = root < r.count && (root == r.hand[h].hand || BoneCrc(r.skeleton, root) == kLcHandHash[h]);
+        if (rootOk) r.fhand[h] = fingers::MakeHand(r.parents.data(), r.count, root, chains, h == 1);
+        uint32_t bonesFound = 0;
+        for (int f = 0; f < fingers::kCount && r.fhand[h].valid; ++f)
+            for (int k = 0; k < r.fhand[h].bones[f]; ++k) {
+                r.fingerChain[h][r.fhand[h].bone[f][k]] = true;
+                ++bonesFound;
+            }
+        Log("FINGERS rig %s hand: %s (root %u%s, %u chain bones: thumb %u index %u middle %u ring %u little %u); rest "
+            "locals %s (%u of %u usable)",
+            h ? "right" : "left", r.fhand[h].valid ? "finger chains found" : "finger chains NOT found, captured pose kept",
+            root, root < r.count && BoneCrc(r.skeleton, root) == kLcHandHash[h] ? " LC_hand" : "", bonesFound,
+            r.fhand[h].bones[0], r.fhand[h].bones[1], r.fhand[h].bones[2], r.fhand[h].bones[3], r.fhand[h].bones[4],
+            r.restRead ? "read" : "UNREADABLE", usable, r.count);
+    }
+}
+
 bool BuildRig(void* skel, const SkeletonView& v, const Mat4* clean) {
     Rig& r = g_rig;
     r.skeleton = skel;
@@ -331,6 +427,9 @@ bool BuildRig(void* skel, const SkeletonView& v, const Mat4* clean) {
     r.carried[0].fill(false);
     r.carried[1].fill(false);
     r.fingerRelValid[0] = r.fingerRelValid[1] = false;
+    r.fhand[0] = r.fhand[1] = fingers::Hand{};
+    r.fingerChain[0].fill(false);
+    r.fingerChain[1].fill(false);
     if (!CopyMem(r.parents.data(), v.parents, v.count * sizeof(uint32_t)) ||
         !detail::ValidHierarchy(r.parents.data(), v.count)) {
         g_status.lastFailure = 1;
@@ -390,7 +489,17 @@ bool BuildRig(void* skel, const SkeletonView& v, const Mat4* clean) {
                 kept);
     }
     // EXP-056: the rig as the game names it (copy groups, head groups, roll helpers, item sockets).
-    rigmap::Build(r.map, v.count, r.parents.data(), [&](uint32_t hash) { return HashIndex(skel, v.count, hash); });
+    r.notHead.fill(false);
+    {
+        static std::array<uint32_t, detail::kMaxBones> flags;
+        static std::array<Mat4, detail::kMaxBones> rest;
+        const bool haveRest = RestWorlds(skel, v.count, r.parents.data(), flags.data(), rest.data());
+        rigmap::Build(r.map, v.count, r.parents.data(), [&](uint32_t hash) { return HashIndex(skel, v.count, hash); },
+                      haveRest ? flags.data() : nullptr, haveRest ? &rest[0].m[0] : nullptr);
+        if (!haveRest) Log("FPBODY rig map: the bind pose / class words could not be read; copy bones by name only");
+    }
+    // EXP-063: each forearm roll helper takes the wrist twist of its place along the forearm in the clean pose.
+    const uint32_t rollsFound = rigmap::RollShares(r.map, &clean[0].m[0]);
     r.nameRules = r.adult && r.map.named;
     for (uint32_t b = 0; b < v.count; ++b) r.crc[b] = BoneCrc(skel, b);
     r.handSide[0].fill(false);
@@ -423,18 +532,32 @@ bool BuildRig(void* skel, const SkeletonView& v, const Mat4* clean) {
                 r.handSide[h][b] = side;
             }
         }
-        uint32_t rolls[2]{};
-        for (int s = 0; s < 2; ++s)
-            for (int k = 0; k < 3; ++k) rolls[s] += r.map.rolls[s][k] < v.count;
-        Log("FPBODY rig map (game naming, EXP-056): %u copy bones follow the bone they copy; head = M_Neck + LC_M_Head + "
-            "LC_EX_M_Head groups, %u bones (the old distance rule also hid %u: %s); forearm roll helpers L %u/3 R %u/3; "
-            "item sockets %u; finger groups L %u R %u",
-            r.map.drivers, r.map.hidden, oldOnly, oldOnly ? list : "none", rolls[0], rolls[1], r.map.sockets,
-            r.map.lcHand[0], r.map.lcHand[1]);
+        Log("FPBODY rig map (game naming, EXP-056 / EXP-063): %u copy bones follow the bone they copy (%u matched by "
+            "their rest place); head = M_Neck + LC_M_Head + LC_EX_M_Head groups, %u bones (%u of them below copies of "
+            "the head: head sockets; the old distance rule also hid %u: %s); item sockets %u; finger groups L %u R %u",
+            r.map.drivers, r.map.restDrivers, r.map.hidden, r.map.hiddenCopies, oldOnly, oldOnly ? list : "none",
+            r.map.sockets, r.map.lcHand[0], r.map.lcHand[1]);
+        Log("FPBODY forearm roll helpers (share of the wrist twist, Roll1..): L %u [%.2f %.2f %.2f %.2f %.2f %.2f] "
+            "R %u [%.2f %.2f %.2f %.2f %.2f %.2f]",
+            rollsFound & 0xff, r.map.rollShare[0][0], r.map.rollShare[0][1], r.map.rollShare[0][2], r.map.rollShare[0][3],
+            r.map.rollShare[0][4], r.map.rollShare[0][5], (rollsFound >> 8) & 0xff, r.map.rollShare[1][0],
+            r.map.rollShare[1][1], r.map.rollShare[1][2], r.map.rollShare[1][3], r.map.rollShare[1][4],
+            r.map.rollShare[1][5]);
     } else {
         Log("FPBODY rig map: %s (copy groups %s): earlier rules kept", r.adult ? "named groups missing" : "young-Jodie rules",
             r.map.named ? "named" : "not named");
+        // EXP-063 (owner 2026-11-11: "fix her too"): the distance rule also takes the shoulder, upper-arm and collar
+        // skin helpers that rest near her head (all 13 JHO9 rigs in the game files). The rig says whose they are: a bone
+        // below a copy of the spine, a shoulder or an arm is that bone's skin, not her head. Nothing else of her head
+        // set changes (her hair helpers hang below the head's copy group and stay hidden).
+        if (r.map.named) {
+            const uint32_t released = rigmap::ReleaseNonHead(r.map, r.parents.data(), r.hideTree.data(), r.notHead.data());
+            r.hidden -= released < r.hidden ? released : r.hidden;
+            Log("FPBODY head set: %u bone(s) near her head are skin helpers of her spine / shoulders / arms and stay "
+                "(the rig's copy groups); %u hidden", released, r.hidden);
+        }
     }
+    BuildFingers(r);  // EXP-067: every rig (young Jodie too, owner 2026-11-17)
     g_autoDumpAt = GetTickCount64() + 4000;
     r.attachDriver.fill(-1);
     r.candOf.fill(-1);
@@ -838,10 +961,149 @@ extern uint64_t g_renderSerial;
 // EXP-056: after the arm chain is solved, every copy bone of this arm (LC_EX_<S>_Arm / _ForeArm / _Hand, LC_<S>_Hand)
 // is put back on the bone it copies the way the game composes it (its offset from that bone in this frame's pose),
 // and its children follow with their authored locals: skin helpers, roll bones, fingers, item sockets. Then the three
-// forearm roll helpers take 1/3, 2/3 and all of the extra wrist twist about the forearm (the game's roll expressions
-// share a joint twist out like this, e.g. `EX_R_Arm_Roll2.rotateX = 0.6667 * BB_R_Arm_TwistX.twist`). While the hand
+// forearm roll helpers each take the share of the extra wrist twist of their place along the forearm (EXP-063: the
+// helpers are numbered from the wrist back, Roll1 at 84 % of the forearm ... Roll4 at 18 % on adult Jodie; the game's
+// roll expressions share a joint twist out like this, e.g. `EX_R_Arm_Roll2.rotateX = 0.6667 * BB_R_Arm_TwistX.twist`,
+// and Arm_Roll2 rests at two thirds of the upper arm). While the hand
 // holds nothing, the fingers keep the pose captured once (owner: no animated fingers on the controller); while an item
 // hangs off one of its bones, the fingers keep the animation's grip so the item sits in them as in third person.
+// ---- EXP-067: fingers on the controllers (playbook 14.6 / 14.7 / 14.10 / 14.12, 19.8 point 2) ----
+std::atomic<bool> g_fingersOn{true};    // b2svr.ini fp_fingers
+std::atomic<bool> g_fingersRest{true};  // b2svr.ini fp_fingers_rest_shape
+struct FingerState {
+    float amount[fingers::kCount]{0.35f, 0.25f, 0.45f, 0.45f, 0.45f};
+    float weight = 1.f;     // 1 = fingers driven, 0 = the animation's own hand (an item in it)
+    bool holding = false, init = false;
+    fingers::Source source = fingers::Source::Resting;
+    fingers::Report report{};
+    LARGE_INTEGER last{};
+} g_finger[2];
+uint64_t g_fingerLogAt = 0;
+alignas(16) std::array<Mat4, detail::kMaxBones> g_fingerAnim, g_fingerBlend;
+
+float FingerDt(FingerState& st) {
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    const float dt = st.last.QuadPart ? float(double(now.QuadPart - st.last.QuadPart) / double(freq.QuadPart)) : 0.f;
+    st.last = now;
+    return std::clamp(dt, 0.f, 0.25f);
+}
+
+// The hand's fingers this frame (after its copy group was put on the solved hand, with this frame's animated locals):
+// rest shape + curl from the controller while the hand is empty, the animation's own hand while it holds an item, a
+// blend over the curl filter's time in between (never a jump). Bones below a chain bone that are not finger bones
+// follow it with their animated locals.
+void DriveFingers(unsigned h, bool holding, uint32_t heldBone) {
+    Rig& r = g_rig;
+    const fingers::Hand& fh = r.fhand[h];
+    FingerState& st = g_finger[h];
+    const float dt = FingerDt(st);
+    fingers::Input in;
+    in.trigger = g_plan.trigger[h];
+    in.squeeze = g_plan.grip[h];
+    in.triggerTouch = g_plan.triggerTouch[h];
+    in.thumbTouch = g_plan.thumbTouch[h];
+    in.touchSeen = g_plan.touchSeen[h];
+    float target[fingers::kCount];
+    st.source = fingers::Targets(in, target);
+    if (!st.init) {
+        std::copy(target, target + fingers::kCount, st.amount);
+        st.weight = holding ? 0.f : 1.f;
+        st.init = true;
+    }
+    fingers::Step(st.amount, target, dt);
+    st.weight = fingers::Approach(st.weight, holding ? 0.f : 1.f, fingers::kRate * dt);
+    if (holding != st.holding) {
+        st.holding = holding;
+        if (holding)
+            Log("FINGERS %s hand holds an item (her bone %u, crc %08x): finger detection off, the animation's own hand",
+                h ? "right" : "left", heldBone, heldBone < r.count ? r.crc[heldBone] : 0u);
+        else
+            Log("FINGERS %s hand is empty again: finger detection on", h ? "right" : "left");
+    }
+    if (st.weight <= 0.f) return;  // the animation's hand, exactly
+    for (int f = 0; f < fingers::kCount; ++f)
+        for (int k = 0; k < fh.bones[f]; ++k) g_fingerAnim[fh.bone[f][k]] = g_arm[fh.bone[f][k]];
+    g_fingerAnim[fh.root] = g_arm[fh.root];
+    // Non-finger bones below a chain bone (none on the game's rigs; any other rig) keep their animated locals.
+    static std::array<Mat4, detail::kMaxBones> belowLocal;
+    static std::array<bool, detail::kMaxBones> below;
+    uint32_t belowCount = 0;
+    for (uint32_t b = 0; b < r.count; ++b) {
+        below[b] = false;
+        if (r.fingerChain[h][b] || b == fh.root) continue;
+        for (uint32_t a = r.parents[b], steps = 0; a < r.count && steps <= r.count; a = r.parents[a], ++steps)
+            if (r.fingerChain[h][a]) {
+                below[b] = fingers::LocalOf(g_arm[b], g_arm[r.parents[b]], belowLocal[b]);
+                belowCount += below[b];
+                break;
+            }
+    }
+    fingers::Report rep;
+    if (!fingers::Pose(fh, r.restLocal.data(), r.restOk.data(), st.amount, g_fingersRest.load(std::memory_order_relaxed),
+                       g_arm.data(), &rep)) {
+        for (int f = 0; f < fingers::kCount; ++f)
+            for (int k = 0; k < fh.bones[f]; ++k) g_arm[fh.bone[f][k]] = g_fingerAnim[fh.bone[f][k]];
+        IssueOnce(256u << h, h ? "FINGERS right hand pose failed; the captured fingers kept"
+                              : "FINGERS left hand pose failed; the captured fingers kept");
+        return;
+    }
+    st.report = rep;
+    if (st.weight < 1.f) {
+        g_fingerBlend[fh.root] = g_arm[fh.root];
+        if (fingers::BlendHand(fh, g_fingerAnim.data(), g_arm.data(), st.weight, g_fingerBlend.data()))
+            for (int f = 0; f < fingers::kCount; ++f)
+                for (int k = 0; k < fh.bones[f]; ++k) g_arm[fh.bone[f][k]] = g_fingerBlend[fh.bone[f][k]];
+    }
+    for (uint32_t pass = 0, left = belowCount; left && pass < 8; ++pass)
+        for (uint32_t b = 0; b < r.count; ++b) {
+            if (!below[b] || below[r.parents[b]]) continue;  // parents first
+            g_arm[b] = pose::Mul(belowLocal[b], g_arm[r.parents[b]]);
+            below[b] = false;
+            --left;
+        }
+}
+
+// Every 10 s while first person drives the fingers: which path they took (playbook 14.12: say in every run whether the
+// fingers came from the controllers' finger touch or from the resting bases).
+void LogFingers() {
+    const uint64_t now = GetTickCount64();
+    if (now < g_fingerLogAt) return;
+    g_fingerLogAt = now + 10000;
+    for (unsigned h = 0; h < 2; ++h) {
+        const FingerState& st = g_finger[h];
+        if (!st.init) continue;
+        Log("FINGERS %s on (%s): thumb %.2f index %.2f middle %.2f ring %.2f little %.2f, %s; rest shape %u bones "
+            "(%u kept the animation's), own-axis joints %u, palm-axis joints %u",
+            h ? "right" : "left",
+            st.source == fingers::Source::Touch ? "from finger touch: point, fist; thumb from grip"
+                                                : "resting bases: this controller reported no finger touch yet",
+            st.amount[0], st.amount[1], st.amount[2], st.amount[3], st.amount[4],
+            st.holding ? "holding an item (the animation's hand)" : "hand empty", st.report.restUsed,
+            st.report.restRefused, st.report.ownAxis, st.report.palmAxis);
+    }
+}
+
+// The engine links an item node to a bone of this hand (within the last 90 frames). Named rigs: the hand subtree and
+// its copy groups (handSide); young-Jodie rules: the hand subtree, her finger copy group (carried) or a prop socket the
+// arm-helper learning attached to her hand (the same sides LogHeldItem uses).
+bool HandHolding(unsigned h, uint32_t* heldBone) {
+    const Rig& r = g_rig;
+    const HandRig& hr = r.hand[h];
+    for (uint32_t i = 0; i < r.count; ++i) {
+        if (!g_socketSeen[i] || g_renderSerial - g_socketSeen[i] >= 90) continue;
+        const bool side = r.nameRules ? r.handSide[h][i]
+                                      : (hr.hand < r.count && (detail::Descendant(r.parents.data(), r.count, i, hr.hand) ||
+                                                               r.carried[h][i] || r.attachDriver[i] == int16_t(hr.hand)));
+        if (side) {
+            *heldBone = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool CarryNamedCopies(unsigned h, Vec3 foreAxis) {
     Rig& r = g_rig;
     const HandRig& hr = r.hand[h];
@@ -855,19 +1117,22 @@ bool CarryNamedCopies(unsigned h, Vec3 foreAxis) {
         if (!detail::RebuildDescendants(g_body.data(), r.parents.data(), r.count, c, replacement, g_arm.data())) return false;
     }
     if (fp::Finite(foreAxis) && fp::Len(foreAxis) > 0.5f && std::isfinite(g_wristRoll[h]))
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < rigmap::kMaxRolls; ++k) {
             const uint32_t b = r.map.rolls[h][k];
             if (b >= r.count) continue;
-            const float angle = g_wristRoll[h] * float(k + 1) / 3.f, half = angle * 0.5f;
+            const float angle = g_wristRoll[h] * r.map.rollShare[h][k], half = angle * 0.5f;
             const pose::Quat q{foreAxis.x * std::sin(half), foreAxis.y * std::sin(half), foreAxis.z * std::sin(half),
                                std::cos(half)};
             Mat4 turned = pose::Mul(g_arm[b], pose::FromPose(q, {0, 0, 0}));
             SetPosition(turned, Position(g_arm[b]));
             if (!detail::RebuildDescendants(g_body.data(), r.parents.data(), r.count, b, turned, g_arm.data())) return false;
         }
-    bool holding = false;
-    for (uint32_t i = 0; i < r.count && !holding; ++i)
-        holding = r.handSide[h][i] && g_socketSeen[i] && g_renderSerial - g_socketSeen[i] < 90;
+    uint32_t heldBone = kAbsent;
+    const bool holding = HandHolding(h, &heldBone);
+    // EXP-067: with finger detection the chain bones keep this frame's animated locals here (DriveFingers takes them as
+    // the animation's hand for the held-item blend, then poses them); the calm pose captured once still applies to the
+    // other bones of the copy group.
+    const bool driveFingers = g_fingersOn.load(std::memory_order_relaxed) && r.fhand[h].valid;
     if (!holding && hr.lc < r.count) {
         Mat4 inverse;
         if (!detail::AffineInverse(g_body[hr.hand], inverse)) return true;
@@ -881,9 +1146,10 @@ bool CarryNamedCopies(unsigned h, Vec3 foreAxis) {
             bool socket = false;  // sockets and what hangs below them stay live
             for (uint32_t s = i, steps = 0; s < r.count && steps <= r.count && !socket; s = r.parents[s], ++steps)
                 socket = r.map.socket[s];
-            if (!socket) g_arm[i] = pose::Mul(r.fingerRel[h][i], g_arm[hr.hand]);
+            if (!socket && !(driveFingers && r.fingerChain[h][i])) g_arm[i] = pose::Mul(r.fingerRel[h][i], g_arm[hr.hand]);
         }
     }
+    if (driveFingers) DriveFingers(h, holding, heldBone);
     return true;
 }
 bool SolveArmImpl(unsigned h) {
@@ -945,10 +1211,10 @@ bool SolveArmImpl(unsigned h) {
             const Vec3 a = project(predicted), b = project(wristRot);
             const float roll = std::atan2(fp::Dot(fp::Cross(a, b), axis), fp::Dot(a, b));
             g_wristRoll[h] = fp::Finite(a) && fp::Finite(b) && std::isfinite(roll) ? roll : 0.f;
-            // EXP-056: a named rig with its three forearm roll helpers shares the twist out along them (the game's
+            // EXP-056 / EXP-063: a named rig with forearm roll helpers shares the twist out along them (the game's
             // rig: the forearm bone itself does not twist), so the forearm keeps its solved basis.
-            const bool rollHelpers = r.nameRules && r.map.rolls[h][0] < r.count && r.map.rolls[h][1] < r.count &&
-                                     r.map.rolls[h][2] < r.count;
+            bool rollHelpers = false;
+            for (int k = 0; k < rigmap::kMaxRolls && r.nameRules; ++k) rollHelpers |= r.map.rolls[h][k] < r.count;
             if (!rollHelpers && fp::Finite(a) && fp::Finite(b) && std::isfinite(roll)) {
                 // Half the roll, both arms alike. (Owner 0.16.13, young Jodie: the right arm's 35 deg cap
                 // let the hand and its cuff turn past the sleeve and showed her real wrist "at certain
@@ -987,6 +1253,24 @@ bool SolveArmImpl(unsigned h) {
         }
         for (uint32_t i = 0; i < r.count; ++i)
             if (r.carried[h][i]) g_arm[i] = pose::Mul(rig.fingerRel[h][i], g_arm[hr.hand]);
+        // EXP-067 (owner 2026-11-17: "Yes, young Jodie too"): her fingers on the controllers as on the named rigs. The
+        // finger group's root stays where her rules put it; the chain bones take this frame's animated locals from it
+        // (the animation's hand while she holds an item), then DriveFingers poses them.
+        if (g_fingersOn.load(std::memory_order_relaxed) && r.fhand[h].valid) {
+            const fingers::Hand& fh = r.fhand[h];
+            for (int f = 0; f < fingers::kCount; ++f) {
+                uint32_t parent = fh.root;
+                for (int k = 0; k < fh.bones[f]; ++k) {
+                    const uint32_t b = fh.bone[f][k];
+                    Mat4 local;
+                    if (fingers::LocalOf(g_body[b], g_body[parent], local)) g_arm[b] = pose::Mul(local, g_arm[parent]);
+                    parent = b;
+                }
+            }
+            uint32_t heldBone = kAbsent;
+            const bool holding = HandHolding(h, &heldBone);
+            DriveFingers(h, holding, heldBone);
+        }
     }
     // Learned helpers (wrist / sleeve / twist bones outside the arm subtree) follow their driver.
     for (uint32_t i = 0; i < r.count; ++i) {
@@ -1217,7 +1501,7 @@ void LearnHeadFollowers(const Mat4* pose, uint32_t count) {
         f.decided[b] = true;
         uint32_t added = 0;
         for (uint32_t d = 0; d < count; ++d)
-            if (!r.hideTree[d] && !r.carried[0][d] && !r.carried[1][d] && r.attachDriver[d] < 0 &&
+            if (!r.hideTree[d] && !r.notHead[d] && !r.carried[0][d] && !r.carried[1][d] && r.attachDriver[d] < 0 &&
                 (d == b || detail::Descendant(r.parents.data(), count, d, b))) {
                 r.hideTree[d] = true;
                 ++added;
@@ -1330,6 +1614,8 @@ bool ComputeEdits() {
     if (g_plan.armsActive) {
         SolveArm(0);
         SolveArm(1);
+        if (g_fingersOn.load(std::memory_order_relaxed) && (r.fhand[0].valid || r.fhand[1].valid))
+            LogFingers();
     } else {
         g_status.armState[0] = g_status.armState[1] = 0;
     }
@@ -1741,6 +2027,24 @@ struct Follower {
     std::array<int16_t, 256> nameMap{};
     std::array<uint32_t, 256> parents{};
     bool nameLogged = false;
+    // EXP-064: parents of a copied skeleton (bones not on hers hang off their parent), re-read every ~45 plan frames.
+    uint64_t copyParentsFor = ~0ull;
+    bool copyParentsOk = false;
+    bool carriedLogged = false;
+    bool inStep = false;                      // the engine plays it in step with her (SyncMotionKit)
+    uint32_t copyHands[2]{~0u, ~0u};          // its EA_L_ATTACH01 / EA_R_ATTACH01 bones (count = none)
+    std::array<uint32_t, 256> copyCrcs{};
+    // EXP-069 (playbook revision 37, 19.8 point 11 L2 c): an object in her motion graph's follower list whose skeleton
+    // does not copy hers (the skis), decided per sample by the held rule (carry::MovieCarry, nearest model bone).
+    uint64_t inStepFor = ~0ull;               // plan-serial bucket of the follower-list test
+    bool inStepList = false;                  // its skeleton is in player::State::syncedProps
+    carry::MovieCarry held{};
+    float heldWt[2]{0.f, 0.f};
+    int64_t heldLast = 0;                     // QPC of the last sample (30 Hz, the clips' rate)
+    uint8_t modelState = 0;                   // 0 not read, 1 read (modelBone valid), 2 unreadable (all bones)
+    std::array<bool, 256> modelBone{};        // bones its mesh is bound to (inverse bind != identity)
+    uint64_t heldSerial = 0;                  // render serial of the last use (a gap restarts the rule)
+    bool heldLogged[2]{false, false};
 };
 #pragma warning(pop)
 // More slots than skinned elements near her in a crowded scene (LIVE 0.14.2: 64 slots thrashed in
@@ -2046,45 +2350,100 @@ const Mat4* HierarchyMappedPose(Follower& f, const Mat4* src, uint32_t count) {
     // Paired bones: her bone's own edit (clean -> drawn) applied to the paired bone (where it sits exactly on hers this
     // is her drawn bone); the rest from their parent, parents first (any index order); a root of its own hangs on its
     // node, which the engine puts on her node (FUN_14026a5f0): it turns with her drawn body.
-    std::array<bool, 256> done{};
-    uint32_t left = count;
-    for (uint32_t j = 0; j < count; ++j)
-        if (f.nameMap[j] >= 0) {
-            const uint32_t k = uint32_t(f.nameMap[j]);
-            Mat4 inv;
-            f.pose[j] = SameBone(g_current[j], o.clean[k]) || !detail::AffineInverse(o.clean[k], inv)
-                            ? g_renderPose[k]
-                            : pose::Mul(pose::Mul(g_current[j], inv), g_renderPose[k]);
-            if (!fp::ValidMatrix(f.pose[j])) f.pose[j] = g_renderPose[k];
-            done[j] = true;
-            --left;
-        }
-    for (uint32_t pass = 0; left && pass < count; ++pass) {
-        bool progress = false;
-        for (uint32_t j = 0; j < count; ++j) {
-            if (done[j]) continue;
-            const uint32_t p = f.parents[j];
-            if (p < count && !done[p]) continue;
-            Mat4 inv;
-            if (p < count && detail::AffineInverse(g_current[p], inv))
-                f.pose[j] = pose::Mul(pose::Mul(g_current[j], inv), f.pose[p]);
-            else  // a root of its own: its node is on her node (FUN_1411dd920), so it turns with her drawn body
-                f.pose[j] = g_bodyDeltaValid ? pose::Mul(g_current[j], g_bodyDelta) : g_current[j];
-            if (!fp::ValidMatrix(f.pose[j])) f.pose[j] = g_current[j];
-            done[j] = true;
-            --left;
-            progress = true;
-        }
-        if (!progress) break;
-    }
+    // (detail::MappedCarry, fpbody.h: moved there unchanged for the L5 desk replay, EXP-069.) Every paired bone k is one
+    // of her bones (nameMap < r.count <= o.count, checked when the map was built).
+    const uint32_t left = detail::MappedCarry(g_current.data(), f.parents.data(), f.nameMap.data(), o.clean.data(),
+                                              g_renderPose.data(), g_bodyDeltaValid ? &g_bodyDelta : nullptr,
+                                              f.pose.data(), count);
     if (left) return nullptr;
     ++g_status.attachedHidden;
     return f.pose.data();
 }
 
+// EXP-069 (playbook revision 37, 19.8 point 11 L2 c / L3): an object the engine plays in step with her (its skeleton is
+// in her motion graph's follower list, player::State::syncedProps, EXP-064) whose skeleton does not copy hers (L1
+// table: the two skis, DRAGSKI, 11 bones) is linked to her but to no bone of hers. The follower list makes it only a
+// CANDIDATE; the held rule (carry::MovieCarry, Heavy Rain's, unchanged) decides per 30 Hz sample whether a hand holds it,
+// measured from her CLEAN wrists to the object's NEAREST bone (FeedPoints: every bone of its skeleton, never only the
+// root). Held: every bone is drawn with that hand's correction (BlendCarry: clean^-1 x drawn, weights ramped over 6
+// samples) and the hand counts as holding (g_socketSeen: the fingers play the animation, L3). Not held: nullptr, the
+// caller keeps the earlier path. Render-only (L4): the object's own bones are never written.
+bool ReadInverseBinds(void* elem, uint32_t count, Mat4* out);
+// Revision 37: distances to the bones that carry the MODEL. The skin's inverse binds (element +0x60, STATIC
+// FUN_1409e69c0) are identity for bones the mesh is not bound to (EXP-067 CheckRestAgainstSkin). DATA (EXP-069): the
+// ski (DRAGSKI) is skinned to bones 0 - 6 (root, tip, tail, binding), never to its R_Foot / L_Foot copies.
+void ReadModelBones(Follower& f, void* elem, uint32_t count) {
+    static std::array<Mat4, 256> inv;
+    f.modelState = 2;
+    if (!elem || count > 256 || !ReadInverseBinds(elem, count, inv.data())) return;
+    uint32_t bound = 0;
+    for (uint32_t b = 0; b < count; ++b) {
+        bool identity = true;
+        for (int k = 0; k < 16 && identity; ++k) identity = std::fabs(inv[b].m[k] - (k % 5 == 0 ? 1.f : 0.f)) < 1e-6f;
+        f.modelBone[b] = !identity;
+        bound += !identity;
+    }
+    if (bound) f.modelState = 1;
+}
+const Mat4* InStepHeld(Follower& f, void* elem, const Mat4* src, uint32_t count) {
+    if (f.inStepFor != g_planSerial / 45) {
+        f.inStepFor = g_planSerial / 45;
+        void* skel = SkeletonOf(src);
+        const player::State st = player::Last();
+        f.inStepList = false;
+        for (uint32_t i = 0; skel && i < st.syncedPropCount; ++i) f.inStepList |= st.syncedProps[i] == skel;
+    }
+    const Rig& r = g_rig;
+    const auto& o = g_overlay;
+    const uint32_t hb[2] = {r.hand[0].hand, r.hand[1].hand};
+    if (!f.inStepList || count > 256 || (hb[0] >= o.count && hb[1] >= o.count)) {
+        f.held = carry::MovieCarry{};
+        f.heldWt[0] = f.heldWt[1] = 0.f;
+        return nullptr;
+    }
+    if (g_renderSerial - f.heldSerial > 30) {  // not drawn for a while (first person was off, another scene): restart
+        f.held = carry::MovieCarry{};
+        f.heldWt[0] = f.heldWt[1] = 0.f;
+        f.heldLast = 0;
+    }
+    f.heldSerial = g_renderSerial;
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    const float* clean[2] = {hb[0] < o.count ? o.clean[hb[0]].m : nullptr, hb[1] < o.count ? o.clean[hb[1]].m : nullptr};
+    if (!f.modelState) ReadModelBones(f, elem, count);
+    if (!f.heldLast || double(now.QuadPart - f.heldLast) >= double(freq.QuadPart) / 30.0) {
+        f.heldLast = now.QuadPart;
+        std::array<float, 256 * 3> pts{};
+        int n = 0;
+        for (uint32_t j = 0; j < count; ++j) {
+            if (f.modelState == 1 && !f.modelBone[j]) continue;
+            for (int k = 0; k < 3; ++k) pts[size_t(n) * 3 + k] = g_current[j].m[12 + k];
+            ++n;
+        }
+        const float* head = r.head < o.count ? o.clean[r.head].m : nullptr;
+        f.held.FeedPoints(true, pts.data(), n, clean, f.heldWt, head);
+    }
+    if (!(f.heldWt[0] > 0.f) && !(f.heldWt[1] > 0.f)) return nullptr;
+    const float* drawn[2] = {hb[0] < o.count ? g_renderPose[hb[0]].m : nullptr,
+                             hb[1] < o.count ? g_renderPose[hb[1]].m : nullptr};
+    for (uint32_t j = 0; j < count; ++j) carry::BlendCarry(g_current[j].m, clean, drawn, f.heldWt, f.pose[j].m);
+    for (int h = 0; h < 2; ++h) {
+        if (!(f.heldWt[h] > 0.f) || hb[h] >= g_socketSeen.size()) continue;
+        g_socketSeen[hb[h]] = g_renderSerial;
+        if (!f.heldLogged[h]) {
+            f.heldLogged[h] = true;
+            Log("FPBODY in-step object (%u bones, played in step with her, no copy of her skeleton) held by her %s hand: "
+                "drawn with that hand, fingers play the animation (held rule, EXP-069)", count, h ? "right" : "left");
+        }
+    }
+    ++g_status.propDraws;
+    return f.pose.data();
+}
+
 // EXP-056: `rigid` receives the follower when the element is not a bone copy of her (the caller tries the engine's own
 // attachment, ItemSource, before the motion-learned RigidFollower).
-const Mat4* FollowerSource(const Mat4* src, uint32_t count, Follower** rigid) {
+const Mat4* FollowerSource(void* elem, const Mat4* src, uint32_t count, Follower** rigid) {
     if (rigid) *rigid = nullptr;
     if (!g_renderReady || !g_renderSource || count == 0 || count > 256) return src;
     Follower* f = nullptr;
@@ -2102,7 +2461,7 @@ const Mat4* FollowerSource(const Mat4* src, uint32_t count, Follower** rigid) {
     }
     // Not a bone copy of Jodie and not attached: skip cheaply until the next periodic re-check.
     if (f->builtSerial && f->mapped < 8 && f->nameState != 1 && f->attachDecided && f->attachBone < 0 &&
-        g_planSerial - f->builtSerial <= 45)
+        g_planSerial - f->builtSerial <= 45 && !f->inStepList)  // EXP-069: in-step objects are sampled every frame
         return src;
     RenderSource(g_renderSource);  // her edited pose for this frame's clean pose
     const auto& o = g_overlay;
@@ -2130,9 +2489,70 @@ const Mat4* FollowerSource(const Mat4* src, uint32_t count, Follower** rigid) {
     if (f->mapped >= 8) {
         for (uint32_t j = 0; j < count; ++j)
             f->pose[j] = f->map[j] >= 0 ? g_renderPose[f->map[j]] : g_current[j];
+        // EXP-064 (owner 2026-11-11: "you only are grabbing the handle and the bucket stays near your body"). STATIC
+        // (game files): the carried Navajo bucket IW_ACC_UNDEFINED_CROSSSET_EXT_NAVBUCKETB is a 26-bone copy of her
+        // skeleton (hips .. R_Hand > EA_R_ATTACH01 = the handle) plus one bone 15 cm below the handle (the bucket),
+        // played in step with her (`Bucket:SyncMotionKit(Jodie, "NAVBUCKETB_SKELETON")`, 2002 Navajo Day 1); its
+        // mesh is skinned to the handle and that bone only. The copy bones sit on hers and were drawn from her drawn
+        // pose; a bone on none of hers kept its animated world, so the handle went with the controller and the bucket
+        // stayed. A bone that is not on hers hangs off its parent with this frame's local (parents first), so
+        // everything below a copied bone moves with her drawn bone. tools/item_report.py: 15 props copy her skeleton
+        // with model parts on such bones (bucket, extinguisher, backpack shirts / pants, T-shirt, leg cloth, the Navajo
+        // spirit, young Jodie's plush toy and toy horse). Owner "fix all items": young Jodie's items too (her own body
+        // rules are untouched: this only changes how objects that copy her skeleton are drawn).
+        if (f->mapped < count) {
+            void* skel = SkeletonOf(src);
+            uint32_t skelCount = 0;
+            if (f->copyParentsFor != g_planSerial / 45 || !f->copyParentsOk) {
+                f->copyParentsFor = g_planSerial / 45;
+                f->copyParentsOk = skel && CopyMem(&skelCount, skel, sizeof(skelCount)) && skelCount == count &&
+                                   ReadSkeletonNames(skel, count, f->parents.data(), f->copyCrcs.data());
+                // Its two hand sockets, used only while the engine plays it in step with her (SyncMotionKit list,
+                // player::State::syncedProps): a two-handed object (the extinguisher) whose bones between the hands
+                // hang from the hips follows both drawn hands.
+                f->copyHands[0] = f->copyHands[1] = count;
+                f->inStep = false;
+                if (f->copyParentsOk) {
+                    const player::State st = player::Last();
+                    for (uint32_t i = 0; i < st.syncedPropCount; ++i) f->inStep |= st.syncedProps[i] == skel;
+                    for (uint32_t j = 0; f->inStep && j < count; ++j)
+                        for (int h = 0; h < 2; ++h)
+                            if (f->copyCrcs[j] == kSocketHash[h] && f->map[j] >= 0) f->copyHands[h] = j;
+                }
+            }
+            if (f->copyParentsOk) {
+                std::array<bool, 256> onHers{};
+                for (uint32_t j = 0; j < count; ++j) onHers[j] = f->map[j] >= 0;
+                const uint32_t carried = detail::CarryUnmapped(g_current.data(), f->parents.data(), onHers.data(),
+                                                               f->pose.data(), count, f->copyHands[0], f->copyHands[1]);
+                if (carried && !f->carriedLogged) {
+                    f->carriedLogged = true;
+                    Log("FPBODY copied skeleton %p: %u of %u bones on hers, %u more hang off them and are carried with "
+                        "her drawn bones%s", skel, f->mapped, count, carried,
+                        f->inStep ? (f->copyHands[0] < count && f->copyHands[1] < count
+                                         ? " (played in step with her, both hand sockets: bones between the hands "
+                                           "follow both)"
+                                         : " (played in step with her)")
+                                  : "");
+                }
+                // Playbook revision 37, 19.8 point 11 L3 (2026-11-20): one holding signal from every route. An object
+                // played in step with her whose hand socket (EA_L / EA_R_ATTACH01 of its copy) lies on her socket THIS
+                // frame is in that hand: the fingers play the animation (DriveFingers), as for a socket-linked item.
+                // Before, only items linked through a node (g_socketSeen at the node-link carry) froze the fingers;
+                // the bucket / extinguisher handle sat in a hand whose fingers still followed the controller.
+                if (f->inStep)
+                    for (int h = 0; h < 2; ++h) {
+                        const uint32_t j = f->copyHands[h];
+                        if (j < count && f->map[j] >= 0 && uint32_t(f->map[j]) < g_socketSeen.size())
+                            g_socketSeen[uint32_t(f->map[j])] = g_renderSerial;
+                    }
+            }
+        }
         ++g_status.attachedHidden;
         return f->pose.data();
     }
+    // EXP-069: played in step with her but no copy of her skeleton: the held rule decides (nullptr = not in a hand).
+    if (const Mat4* held = InStepHeld(*f, elem, src, count)) return held;
     // Large skeletons (> 64 bones) may only attach to her head / hair bones (RigidFollower): LIVE
     // 0.14.1 (Embassy reception) every 256-bone character "attached" to her fingers / arm helpers for
     // 2-14 s (handshakes) was redrawn from her pose and lost its shadows; but hair or a hat with its
@@ -2164,9 +2584,10 @@ const Mat4* ItemSource(void* elem, const Mat4* src) {
     if (RenderSource(ja) == ja || !PropWorldFromEdited(world, jcount)) return src;
     Mat4 clean, inv;
     if (!ReadMatrix(world, &clean) || !detail::AffineInverse(clean, inv)) return src;
-    const Mat4 delta = pose::Mul(inv, g_propWorld);
     if (!CopyMem(g_itemPose.data(), src, count * sizeof(Mat4))) return src;
-    for (uint32_t j = 0; j < count; ++j) g_itemPose[j] = pose::Mul(g_itemPose[j], delta);
+    // L2 (a), EXP-069: the bone's own correction, carry::Rebase (item x clean node^-1 x drawn node), the function the
+    // L5 desk replay (tests/carry_desk.cpp) runs on every F1 pair.
+    for (uint32_t j = 0; j < count; ++j) carry::Rebase(g_itemPose[j].m, clean.m, g_propWorld.m, g_itemPose[j].m);
     ++g_status.propDraws;
     if (!g_loggedItem) {
         g_loggedItem = true;
@@ -2175,10 +2596,57 @@ const Mat4* ItemSource(void* elem, const Mat4* src) {
     return g_itemPose.data();
 }
 
+// EXP-067 (playbook 14.12 "the rest shape from the skinning data"): once per rig, for up to four of her skinned
+// elements, the skin's inverse binds (element +0x60, one 0x40-byte matrix per bone of the world array +0x70, STATIC
+// FUN_1409e69c0: palette = inverse bind x world) times the rig's rest worlds (+0x300 locals composed): identity on
+// every bone the mesh is bound to proves that the rest locals the fingers start from are the skin's bind pose.
+bool ReadInverseBinds(void* elem, uint32_t count, Mat4* out) {
+    __try {
+        const Mat4* inv = *reinterpret_cast<const Mat4**>(static_cast<char*>(elem) + 0x60);
+        if (!inv) return false;
+        std::memcpy(out, inv, size_t(count) * sizeof(Mat4));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void CheckRestAgainstSkin(void* elem, uint32_t count) {
+    Rig& r = g_rig;
+    if (r.restChecked || !r.restWorldRead || count != r.count) return;
+    if (++r.restChecks >= 4) r.restChecked = true;
+    static std::array<Mat4, detail::kMaxBones> inv;
+    if (!ReadInverseBinds(elem, count, inv.data())) {
+        Log("FINGERS rest check: element %p inverse binds unreadable", elem);
+        return;
+    }
+    uint32_t bound = 0, match = 0, fingerBound = 0, fingerMatch = 0;
+    float worst = 0.f, worstFinger = 0.f;
+    for (uint32_t b = 0; b < count; ++b) {
+        bool identity = true;
+        for (int k = 0; k < 16 && identity; ++k) identity = std::fabs(inv[b].m[k] - (k % 5 == 0 ? 1.f : 0.f)) < 1e-6f;
+        if (identity) continue;  // a bone this mesh is not bound to (left at identity)
+        const Mat4 m = pose::Mul(inv[b], r.restWorld[b]);
+        float d = 0.f;
+        for (int k = 0; k < 16; ++k) d = std::max(d, std::fabs(m.m[k] - (k % 5 == 0 ? 1.f : 0.f)));
+        const bool finger = r.fingerChain[0][b] || r.fingerChain[1][b];
+        ++bound;
+        match += d < 2e-3f;
+        worst = std::max(worst, d);
+        if (finger) {
+            ++fingerBound;
+            fingerMatch += d < 2e-3f;
+            worstFinger = std::max(worstFinger, d);
+        }
+    }
+    Log("FINGERS rest check (element %p): inverse bind x rest world = identity on %u of %u bound bones (worst %.4f); "
+        "finger bones %u of %u (worst %.4f)%s",
+        elem, match, bound, worst, fingerMatch, fingerBound, worstFinger,
+        fingerBound && fingerMatch == fingerBound ? ": the rest shape is the skin's bind pose" : "");
+}
+
 void CallWithEdited(ElementFn original, void* elem) {
     if (!elem || !g_active.load(std::memory_order_acquire)) return original(elem);
     std::lock_guard<std::mutex> lock(g_mutex);
     const Mat4* src = ElementSource(elem);
+    if (src && src == g_renderSource && !g_rig.restChecked) CheckRestAgainstSkin(elem, ElementCount(elem));
     const Mat4* use = RenderSource(src);
     // EXP-056 order: a bone copy of her skeleton (clothing with its own skeleton), then the engine's attachment of the
     // item's node to her (bone or body node), and only then the motion-learned attachment for unlinked objects.
@@ -2186,7 +2654,7 @@ void CallWithEdited(ElementFn original, void* elem) {
     Follower* rigid = nullptr;
     const uint32_t count = src ? ElementCount(elem) : 0;
     if (use == src && src && !g_rig.nameRules) use = ItemSource(elem, src);
-    if (use == src && src) use = FollowerSource(src, count, &rigid);
+    if (use == src && src) use = FollowerSource(elem, src, count, &rigid);
     if (use == src && src && g_rig.nameRules) use = ItemSource(elem, src);
     // (ItemSource may have recomputed her pose through g_current: the object's bones are read again.)
     if (use == src && src && rigid && CopyMem(g_current.data(), src, size_t(count) * sizeof(Mat4)))
@@ -3222,6 +3690,12 @@ void SetEdits(bool on) { g_editsOn = on; }
 void SetClothOnePose(bool on) { g_clothOnePose = on; }
 void SetClothTeleports(bool on) { g_clothTeleports = on; }
 void SetHeadCloth(bool on) { g_headCloth = on; }
+void SetFingers(bool on, bool restShape) {
+    g_fingersOn.store(on, std::memory_order_relaxed);
+    g_fingersRest.store(restShape, std::memory_order_relaxed);
+    Log("FINGERS %s (b2svr.ini fp_fingers), rest shape %s (fp_fingers_rest_shape)", on ? "on" : "off",
+        restShape ? "on" : "off");
+}
 void SetItemCull(bool on) { g_itemCull = on; }
 void SetHeadMode(int mode) { g_headMode = mode < 0 || mode > 2 ? 2 : mode; }
 int GetHeadMode() { return g_headMode.load(std::memory_order_relaxed); }

@@ -9,10 +9,12 @@
 
 namespace b2s::panel {
 
-// GOW_STYLE_TEN_ROW_V4 (playbook revision 6: the nine V1 rows plus "Hand smoothing (first person)" after Motion
-// controls, "Rendering method" with Native | AFR | Mono; Beyond has no status meters, so no health-bars row) plus the B2S row "Aiden possessions (first person)"
-// after the two first-person rows (owner 2026-10-28, EXP-046): B2S_ELEVEN_ROW_V2, 1000 x 1690 px at 1.2 m wide
-// (2.028 m high), 0.15 m right of the game screen.
+// B2S_ELEVEN_ROW_V6 (1.0.3, playbook revision 23): the GOW_STYLE_NINE_ROW_V6 rows (Beyond has no status meters, so no
+// health-bars row; no "Hand smoothing" row - revision 13, the owner's rule: hand_smoothing stays in b2svr.ini) plus two
+// B2S rows: "Aiden possessions (first person)" after the two first-person rows (owner 2026-10-28, EXP-046) and
+// "Camera closer (third person)" after the turning rows (owner 2026-11-15: the camera regularly falls outside the
+// walls). V6 style: the patterned grey background and the built-in Montserrat (welcome_draw.cpp), the owner's light
+// blue of the Beyond cover as the accent. 1000 x 1690 px at 1.2 m wide (2.028 m high), 0.15 m right of the game screen.
 constexpr int kWidthPx = 1000, kHeightPx = 1690;
 constexpr float kWidthM = 1.2f, kHeightM = kWidthM * float(kHeightPx) / float(kWidthPx);
 constexpr float kGapM = 0.15f;
@@ -94,6 +96,8 @@ inline int StepSize(int setting, int dir, int autoPx) {
 // Turning speed (smooth: 20 .. 100 %) and snap angle (15 .. 90 deg) presets (GoW).
 constexpr float kSpeeds[] = {0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f};
 constexpr int kSnaps[] = {15, 30, 45, 60, 90};
+// Third-person camera closer (metres, 1.0.3): Off .. 2 m in 0.25 m steps.
+constexpr float kPushes[] = {0.f, 0.25f, 0.5f, 0.75f, 1.f, 1.25f, 1.5f, 1.75f, 2.f};
 template <class T, size_t N>
 inline float StepPreset(const T (&list)[N], float value, int dir) {
     int best = 0;

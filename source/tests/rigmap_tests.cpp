@@ -1,9 +1,13 @@
 // EXP-056 desk tests for the game's rig convention (src/rigmap.h), on a reduced copy of adult Jodie's 255-bone
 // rig (names and parents as in b2svr_logs/skeleton_255_adult.csv).
 #include "../src/rigmap.h"
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+
+// EXP-063: a whole rig from the game files with the picture tool's results (tools/rig_fixture.py).
+#include "rigmap_fixture.inc"
 
 using namespace b2s;
 namespace {
@@ -118,6 +122,82 @@ int main() {
         });
         Check(!p.named && p.drivers == 0, "plain rig is not named");
         Check(p.hide[2] && p.hide[3] && !p.hide[1] && p.hidden == 2, "plain rig head = M_Neck subtree");
+    }
+    // EXP-063: the real rig (IW_JHOB, 253 bones). The C++ rules and the picture tool's port must agree bone for
+    // bone: copy bones by name and by rest place, the head set with the head-mounted socket, the roll shares.
+    {
+        static rigmap::Map f;
+        rigmap::Build(f, kFxCount, kFxParents, [](uint32_t h) {
+            for (uint32_t i = 0; i < kFxCount; ++i)
+                if (kFxCrc[i] == h) return i;
+            return rigmap::kNone;
+        }, kFxFlags, kFxRest);
+        int hideDiff = 0, driverDiff = 0;
+        for (uint32_t i = 0; i < kFxCount; ++i) {
+            hideDiff += f.hide[i] != kFxHide[i];
+            driverDiff += uint32_t(f.driver[i]) != kFxDriver[i];
+        }
+        Check(hideDiff == 0, "real rig: head set equals the picture tool's");
+        Check(driverDiff == 0, "real rig: copy drivers equal the picture tool's");
+        Check(f.restDrivers == kFxRestDrivers && kFxRestDrivers == 3, "real rig: three copies matched by rest place");
+        Check(f.hiddenCopies == kFxHiddenCopies && kFxHiddenCopies == 2, "real rig: head socket copy and socket hidden");
+        auto fx = [](const char* n) {
+            const uint32_t h = bones::Crc32(n);
+            for (uint32_t i = 0; i < kFxCount; ++i)
+                if (kFxCrc[i] == h) return i;
+            return rigmap::kNone;
+        };
+        Check(f.driver[fx("LC_EA_L_ATTACH01")] == fx("L_Hand") && f.driver[fx("LC_EA_R_ATTACH01")] == fx("R_Hand"),
+              "real rig: the item sockets' parents follow the hands");
+        Check(f.hide[fx("EA_M_ATTACH01")] && !f.hide[fx("EA_L_ATTACH01")] && !f.hide[fx("EA_R_ATTACH01")],
+              "real rig: the head socket is hidden, the hand sockets are not");
+        Check(f.driver[fx("LC_EX_M_GRP")] == rigmap::kNone && f.driver[fx("LC_EA_M_GRP")] == rigmap::kNone,
+              "real rig: group roots copy nothing");
+        const uint32_t found = rigmap::RollShares(f, kFxRest);
+        Check(found == (4u | 4u << 8), "real rig: four roll helpers per forearm");
+        float worst = 0.f;
+        for (int s = 0; s < 2; ++s)
+            for (int k = 0; k < rigmap::kMaxRolls; ++k) worst = std::fmax(worst, std::fabs(f.rollShare[s][k] - kFxShare[s][k]));
+        Check(worst < 1e-4f, "real rig: roll shares equal the picture tool's");
+        // Roll1 is the helper nearest the wrist: the twist share falls with the number, and the last is near the elbow.
+        Check(f.rollShare[1][0] > f.rollShare[1][1] && f.rollShare[1][1] > f.rollShare[1][2] &&
+                  f.rollShare[1][2] > f.rollShare[1][3] && f.rollShare[1][0] > 0.6f && f.rollShare[1][3] < 0.3f,
+              "real rig: Roll1 takes the most wrist twist, Roll4 the least");
+        // Young Jodie's distance rule: helpers below a copy of the spine / shoulders / arms leave a head set made by
+        // another rule; head bones and bones under no copy stay as that rule decided.
+        {
+            static bool other[kFxCount], notHead[kFxCount];
+            for (uint32_t i = 0; i < kFxCount; ++i) other[i] = f.hide[i];
+            const uint32_t up = fx("EX_L_UpShoulder"), back = fx("EX_R_BackArm"), lcs = fx("LC_EX_L_Shoulder");
+            const uint32_t hips = fx("M_Hips");
+            other[up] = other[back] = other[lcs] = other[hips] = true;
+            const uint32_t n = rigmap::ReleaseNonHead(f, kFxParents, other, notHead);
+            Check(n == 3 && !other[up] && !other[back] && !other[lcs], "distance rule: shoulder / arm helpers released");
+            Check(other[hips] && !notHead[hips], "distance rule: a bone under no copy bone is left alone");
+            Check(other[fx("FA_L_Eye")] && other[fx("M_Head")] && !notHead[fx("FA_L_Eye")], "distance rule: head stays hidden");
+            Check(notHead[fx("EX_L_ForeArm_Roll1")], "arm helpers are marked as never head");
+        }
+        // Without the class words / rest pose the name rules still work and nothing is matched by place.
+        static rigmap::Map g;
+        rigmap::Build(g, kFxCount, kFxParents, [](uint32_t h) {
+            for (uint32_t i = 0; i < kFxCount; ++i)
+                if (kFxCrc[i] == h) return i;
+            return rigmap::kNone;
+        });
+        Check(g.restDrivers == 0 && g.hiddenCopies == 0 && g.named, "real rig: names only when no rest pose is given");
+        // A rest pose that contradicts the named copies (all bones at the origin but the hands' copies moved) is not
+        // trusted.
+        static float bad[kFxCount * 16];
+        for (uint32_t i = 0; i < kFxCount * 16; ++i) bad[i] = kFxRest[i];
+        for (uint32_t i = 0; i < kFxCount; ++i)
+            if (kFxFlags[i] & rigmap::kFlagCopy) bad[i * 16 + 12] += 0.5f;
+        static rigmap::Map b;
+        rigmap::Build(b, kFxCount, kFxParents, [](uint32_t h) {
+            for (uint32_t i = 0; i < kFxCount; ++i)
+                if (kFxCrc[i] == h) return i;
+            return rigmap::kNone;
+        }, kFxFlags, bad);
+        Check(b.restDrivers == 0, "real rig: an inconsistent rest pose matches nothing");
     }
     // Name lookups for log lines.
     Check(rigmap::KnownName(bones::Crc32("EA_R_ATTACH01")) != nullptr, "socket name known");

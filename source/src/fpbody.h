@@ -28,7 +28,9 @@ struct Plan {
     float pivotRight = 0.f, pivotBack = 0.f;
     pose::Mat4 handWorld[2]{};
     bool handValid[2]{};
-    float trigger[2]{}, grip[2]{};       // no finger mapping is proven yet
+    float trigger[2]{}, grip[2]{};       // analog trigger / squeeze 0..1 (EXP-067: drawn fingers, playbook 14.12)
+    bool triggerTouch[2]{}, thumbTouch[2]{};  // finger touch sensors: index on the trigger, thumb on stick / buttons / rest
+    bool touchSeen[2]{};                 // the controller has reported a finger touch since VR started (else resting bases)
     float wristPitch = 0.f;              // radians, + = fingers further down (b2svr.ini fp_wrist_pitch)
 };
 
@@ -117,6 +119,10 @@ const char* HeadModeName(int mode);
 // 0.24.0 dev A/B (fpitemcull on|off): her items dropped by the engine's visibility where the animation holds them are
 // tested again where they are drawn.
 void SetItemCull(bool on);
+// EXP-067 (playbook 14.12): fingers on the controllers while F1 motion controls own the arms (b2svr.ini fp_fingers, on)
+// and whether they start from the rig's rest shape (fp_fingers_rest_shape, on). Every rig, young Jodie included (owner
+// 2026-11-17).
+void SetFingers(bool on, bool restShape);
 // Dev (fpelems): log every drawable element within 2 m of Jodie for one frame.
 void DumpElements();
 // Dev (fpwatch): addresses of the head bone's translation in both world arrays (+0x10, +0x18).
@@ -318,6 +324,119 @@ inline uint32_t HeadHideSet(const uint32_t* parents, uint32_t count, const pose:
         n+=out[b];
     }
     return n;
+}
+
+// EXP-064: a copied skeleton (an object whose skeleton copies hers bone for bone, played in step with her, e.g. the
+// carried Navajo bucket IW_ACC_UNDEFINED_CROSSSET_EXT_NAVBUCKETB): `pose` already holds her drawn bone for every bone
+// with onHers[j]; every other bone hangs off its parent with this frame's local (current[j] x current[parent]^-1),
+// parents first in any index order, so a bone below a copied bone (the bucket under the handle socket) moves with her
+// drawn bone. Roots and bones whose chain cannot be solved keep their current world. Returns the bones carried.
+// Two-handed objects played in step with her (EXP-064: the extinguisher, tank on her right hand socket, nozzle on her
+// left, hose bones hanging from the hips): when handA / handB are two of the object's bones on her hand sockets, a bone
+// that hangs from neither hand but lies within 25 cm of the line between them follows both: the edit of each hand
+// applied to it, blended by its place t along that line (rotation of the nearer hand). Pass count for no hands.
+// The copy test (EXP-016 / 056): two bone worlds are "the same bone" within 3 mm and 0.02 on the rotation rows.
+inline bool SameBoneWorld(const pose::Mat4& a, const pose::Mat4& b) {
+    for (int k : {12, 13, 14})
+        if (std::fabs(a.m[k] - b.m[k]) > 0.003f) return false;
+    for (int k : {0, 1, 2, 4, 5, 6})
+        if (std::fabs(a.m[k] - b.m[k]) > 0.02f) return false;
+    return true;
+}
+// EXP-056 hierarchy-mapped objects (MapHierarchy: the backpack, coats, shields), moved here unchanged from fpbody.cpp's
+// HierarchyMappedPose so the L5 desk replay (EXP-069) runs the same code. pair[j] = her bone paired with object bone j by
+// name (-1 = none). Paired bones take her bone's own edit (clean -> drawn; where the bone sits exactly on hers, her drawn
+// bone); the rest hang from their parent with this frame's local, parents first; a root of its own takes the body turn
+// (bodyDelta, or none). Returns the bones it could not place (0 = all placed).
+inline uint32_t MappedCarry(const pose::Mat4* current, const uint32_t* parents, const int16_t* pair,
+                            const pose::Mat4* herClean, const pose::Mat4* herDrawn, const pose::Mat4* bodyDelta,
+                            pose::Mat4* out, uint32_t count) {
+    bool done[kMaxBones]{};
+    uint32_t left = count;
+    for (uint32_t j = 0; j < count; ++j)
+        if (pair[j] >= 0) {
+            const uint32_t k = uint32_t(pair[j]);
+            pose::Mat4 inv;
+            out[j] = SameBoneWorld(current[j], herClean[k]) || !AffineInverse(herClean[k], inv)
+                         ? herDrawn[k]
+                         : pose::Mul(pose::Mul(current[j], inv), herDrawn[k]);
+            if (!fp::ValidMatrix(out[j])) out[j] = herDrawn[k];
+            done[j] = true;
+            --left;
+        }
+    for (uint32_t pass = 0; left && pass < count; ++pass) {
+        bool progress = false;
+        for (uint32_t j = 0; j < count; ++j) {
+            if (done[j]) continue;
+            const uint32_t p = parents[j];
+            if (p < count && !done[p]) continue;
+            pose::Mat4 inv;
+            if (p < count && AffineInverse(current[p], inv))
+                out[j] = pose::Mul(pose::Mul(current[j], inv), out[p]);
+            else  // a root of its own: its node is on her node (FUN_1411dd920), so it turns with her drawn body
+                out[j] = bodyDelta ? pose::Mul(current[j], *bodyDelta) : current[j];
+            if (!fp::ValidMatrix(out[j])) out[j] = current[j];
+            done[j] = true;
+            --left;
+            progress = true;
+        }
+        if (!progress) break;
+    }
+    return left;
+}
+
+inline uint32_t CarryUnmapped(const pose::Mat4* current, const uint32_t* parents, const bool* onHers,
+                              pose::Mat4* pose, uint32_t count, uint32_t handA=~0u, uint32_t handB=~0u) {
+    if (!current || !parents || !onHers || !pose || count==0 || count>kMaxBones) return 0;
+    const bool hands=handA<count && handB<count && handA!=handB && onHers[handA] && onHers[handB];
+    pose::Mat4 invA, invB;
+    const bool handInv=hands && AffineInverse(current[handA],invA) && AffineInverse(current[handB],invB);
+    auto underHand=[&](uint32_t j){
+        for (uint32_t a=j,steps=0; a<count && steps<=count; a=parents[a],++steps)
+            if (a==handA || a==handB) return true;
+        return false;
+    };
+    bool done[kMaxBones]{};
+    uint32_t left=0, carried=0;
+    for (uint32_t j=0;j<count;++j) { done[j]=onHers[j]; if (!done[j]) ++left; }
+    for (uint32_t pass=0; left && pass<count; ++pass) {
+        bool progress=false;
+        for (uint32_t j=0;j<count;++j) {
+            if (done[j]) continue;
+            const uint32_t p=parents[j];
+            if (p<count && !done[p]) continue;
+            pose::Mat4 inv;
+            pose[j]=current[j];
+            if (p<count && AffineInverse(current[p],inv)) {
+                const pose::Mat4 m=pose::Mul(pose::Mul(current[j],inv),pose[p]);
+                if (fp::ValidMatrix(m)) { pose[j]=m; ++carried; }
+            }
+            if (handInv && !underHand(j)) {
+                const pose::Vec3 a{current[handA].m[12],current[handA].m[13],current[handA].m[14]};
+                const pose::Vec3 b{current[handB].m[12],current[handB].m[13],current[handB].m[14]};
+                const pose::Vec3 x{current[j].m[12],current[j].m[13],current[j].m[14]};
+                const pose::Vec3 ab=fp::Sub(b,a);
+                const float l2=ab.x*ab.x+ab.y*ab.y+ab.z*ab.z;
+                if (l2>1e-4f) {
+                    const pose::Vec3 ax=fp::Sub(x,a);
+                    float t=(ax.x*ab.x+ax.y*ab.y+ax.z*ab.z)/l2;
+                    t=t<0.f?0.f:(t>1.f?1.f:t);
+                    const pose::Vec3 c{a.x+ab.x*t,a.y+ab.y*t,a.z+ab.z*t};
+                    if (fp::Len(fp::Sub(x,c))<0.25f) {
+                        const pose::Mat4 ma=pose::Mul(pose::Mul(current[j],invA),pose[handA]);
+                        const pose::Mat4 mb=pose::Mul(pose::Mul(current[j],invB),pose[handB]);
+                        pose::Mat4 m=t<0.5f?ma:mb;
+                        for (int k=12;k<15;++k) m.m[k]=ma.m[k]*(1.f-t)+mb.m[k]*t;
+                        if (fp::ValidMatrix(m)) pose[j]=m;
+                    }
+                }
+            }
+            done[j]=true; --left; progress=true;
+        }
+        if (!progress) break;
+    }
+    for (uint32_t j=0;j<count;++j) if (!done[j]) pose[j]=current[j];
+    return carried;
 }
 } // namespace detail
 } // namespace b2s::fpbody

@@ -32,6 +32,9 @@ struct HandInput {
     float stick[2] = {0.f, 0.f};
     float trigger = 0.f, squeeze = 0.f;
     bool a = false, b = false, stickClick = false, menu = false;
+    // Finger touch sensors (EXP-067, playbook 14.12): index on the trigger; thumb on the stick, a face button or the
+    // thumb rest. touchBound: a touch action is active for this hand (bound by the runtime).
+    bool triggerTouch = false, thumbTouch = false, touchBound = false;
 };
 struct FrameInput {
     uint64_t serial = 0, tickMs = 0;
@@ -120,6 +123,6 @@ void SetUiAlphaMode(int mode);
 // EXP-014 discriminator: render and submit symmetric per-eye frustums.
 void SetSymmetricFov(bool on);
 // EXP-018: offset the virtual head (metres up, degrees pitch) for capture tests; 0 0 = off.
-void SetHeadTestOffset(float dy, float pitchDeg);
+void SetHeadTestOffset(float dy, float pitchDeg, float yawDeg = 0.f, float dx = 0.f);
 
 }  // namespace b2s::xr

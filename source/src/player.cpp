@@ -13,6 +13,7 @@
 #include "bodykind.h"
 #include "crashreport.h"
 #include "ctrlprobe.h"
+#include "menuwatch.h"
 #include "bones.h"
 #include "game.h"
 #include "heapscan.h"
@@ -43,6 +44,11 @@ constexpr size_t kMotionKitGraph = 0x50;
 constexpr size_t kGraphSyncedTo = 0x788;
 constexpr size_t kGraphOwnerSub = 0x6c0;
 constexpr size_t kCharSyncSub = 0x128;
+// EXP-064 (STATIC FUN_140a1afa0): a master graph's +0x780 = its latest follower graph, a follower's +0x780 = the next.
+constexpr size_t kGraphFollowers = 0x780;
+// CHARACTER +0x170 = its skeleton (STATIC: HIERARCHY_MAPPING update FUN_1411dd920 reads *(handle+0x30)+0x170; the same
+// object carries the motion kit at +0x340, FUN_140dce550).
+constexpr size_t kCharSkeleton = 0x170;
 // Between two authored base-layer animations the table can be empty for a moment (LIVE 0.22.0: 1.0 s at 233 s and 60 ms
 // at 476 s, both inside cutscenes). Without a physics controller the motion kit only counts as the player's walk once
 // no base-layer animation has played for this long; with the physics controller it counts at once.
@@ -473,6 +479,29 @@ State Poll() {
         s.kitRead = s.jodie && Field(s.jodie, kCharMotionKit, kit) && kit && Field(kit, kMotionKitGraph, graph) && graph &&
                     Field(graph, kGraphSyncedTo, s.synced);
         if (!s.kitRead) s.synced = nullptr;
+        // EXP-064: the objects synced to her (see State::syncedProps).
+        if (s.kitRead && !s.synced) {
+            void* g = nullptr;
+            Field(graph, kGraphFollowers, g);
+            for (int k = 0; g && k < 8 && s.syncedPropCount < 8; ++k) {
+                void* master = nullptr;
+                uint8_t* sub = nullptr;
+                const void* skel = nullptr;
+                if (!Field(g, kGraphSyncedTo, master) || master != graph) break;
+                if (Field(g, kGraphOwnerSub, sub) && reinterpret_cast<uintptr_t>(sub) > 0x10000 + kCharSyncSub &&
+                    Field(sub - kCharSyncSub, kCharSkeleton, skel) && skel)
+                    s.syncedProps[s.syncedPropCount++] = skel;
+                if (!Field(g, kGraphFollowers, g)) break;
+            }
+            static uint32_t loggedCount = 0;
+            static const void* loggedFirst = nullptr;
+            if (s.syncedPropCount != loggedCount || (s.syncedPropCount && s.syncedProps[0] != loggedFirst)) {
+                loggedCount = s.syncedPropCount;
+                loggedFirst = s.syncedPropCount ? s.syncedProps[0] : nullptr;
+                Log("PLAYER %u object(s) played in step with her (SyncMotionKit to her motion graph %p): carried with "
+                    "her drawn hands", s.syncedPropCount, graph);
+            }
+        }
         static void* loggedSynced = nullptr;
         static void* loggedOwner = nullptr;
         if (s.kitRead && (s.synced != loggedSynced || s.jodie != loggedOwner)) {
@@ -502,6 +531,7 @@ State Poll() {
             ctrlprobe::Frame(s.menu ? nullptr : s.jodie);
         }
     }
+    menuwatch::Frame(s.menu);  // 1.0.3: the main menu's Options page (the VR panel beside it, playbook 10.6)
     {
         std::lock_guard lock(g_lastMutex);
         g_last = s;

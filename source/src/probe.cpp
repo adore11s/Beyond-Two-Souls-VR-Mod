@@ -841,8 +841,28 @@ HRESULT STDMETHODCALLTYPE HookGetData(ID3D11DeviceContext* c, ID3D11Asynchronous
     return hr;
 }
 
+// 1.0.3 (owner: "some light auras only render in one eye; usually far away, closer they render in both eyes;
+// depending on where I point my head it works, for example street lights"). STATIC: the deferred point and spot
+// lights (FUN_140808b20 / FUN_140809620, render thread) draw each light's bounding volume inside a GPU occlusion
+// PREDICATE (RENDER_CONTEXT_DX11 vfunc_150: CreatePredicate D3D11_QUERY_OCCLUSION_PREDICATE + PREDICATEHINT, one per
+// light id and frame slot at +0x1a0 + (slot * 100 + id) * 8, Begin; vfunc_153 End) and then draw the light - its
+// volumetric halo (DeferredVolumetricPointLight_ps / ..SpotLight_ps, shader tables +0xfc0 / +0x1240) - under
+// SetPredication (vfunc_154, command FUN_1407e3eb0). A light whose volume holds the camera (+0x2d4 of its record)
+// releases its predicate and is never tested: near lights always draw, far ones depend on the test - the owner's
+// pattern exactly. Both eye passes test and draw with the same predicate objects of the frame slot (+0x7638 advances
+// at Present only), so one eye's halo is decided by a test that is not its own. The predicate only skips work (the
+// light's own draws are still depth-tested), so in VR it is dropped: every light is drawn in both eyes.
+// b2svr.ini light_occlusion=game keeps the game's predicates; dev verb `lightpred game|off`.
+std::atomic<bool> g_dropLightPred{true};
+std::atomic<uint64_t> g_predDropped{0};
+
 void STDMETHODCALLTYPE HookSetPred(ID3D11DeviceContext* c, ID3D11Predicate* p, BOOL value) {
     if (p) g_qPredSet++;
+    if (p && g_dropLightPred.load(std::memory_order_relaxed) && xr::Running()) {
+        if (g_predDropped.fetch_add(1, std::memory_order_relaxed) == 0)
+            Log("LIGHTS occlusion predicates dropped in VR: every light and halo drawn in both eyes (light_occlusion)");
+        p = nullptr;
+    }
     g_origSetPred(c, g_occlForce ? nullptr : p, value);
 }
 
@@ -1031,6 +1051,13 @@ bool Command(const char* verb, const char* arg) {
         g_shCountFrames = arg && std::atoi(arg) > 0 ? std::atoi(arg) : 270;
         return true;
     }
+    if (std::strcmp(verb, "lightpred") == 0) {
+        if (arg && std::strcmp(arg, "game") == 0) g_dropLightPred = false;
+        else if (arg && std::strcmp(arg, "off") == 0) g_dropLightPred = true;
+        Log("LIGHTS occlusion predicates %s in VR (%llu dropped so far)", g_dropLightPred ? "dropped" : "the game's",
+            g_predDropped.load());
+        return true;
+    }
     if (std::strcmp(verb, "occl") == 0) {
         if (arg && std::strcmp(arg, "force") == 0) g_occlForce = true;
         else if (arg && std::strcmp(arg, "off") == 0) g_occlForce = false;
@@ -1066,6 +1093,12 @@ void Install() {
         g_camDump = _wfsopen(dump.c_str(), L"wb", _SH_DENYWR);
     }
     Log("camera dump %s (b2svr.ini devdumps)", g_camDump ? "on" : "off");
+    {
+        wchar_t lo[16] = L"";
+        GetPrivateProfileStringW(L"b2svr", L"light_occlusion", L"vr", lo, 16, (dir + L"\\b2svr.ini").c_str());
+        g_dropLightPred = _wcsicmp(lo, L"game") != 0;
+        Log("b2svr.ini: light_occlusion=%ls (%s)", lo, g_dropLightPred ? "lights drawn in both eyes in VR" : "the game's occlusion predicates");
+    }
 
     FindRdata();
     pacing::Install();

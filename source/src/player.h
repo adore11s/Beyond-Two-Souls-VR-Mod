@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 // The player's character and control state (EXP-031 task 4).
 //
 // LIVE (young Jodie, 0401 JODIE_AND_ANAEL): ANAEL_GAMEPLAY (Aiden's gameplay object, present whenever
@@ -38,6 +39,13 @@ struct State {
     // `kitRead`: she has a motion kit to read (cutscenes have none; then `synced` says nothing).
     void* synced = nullptr;
     bool kitRead = false;
+    // EXP-064: skeletons of the objects played IN STEP with her (their SyncMotionKit has her as the master: the Navajo
+    // bucket, the extinguisher, the skis). STATIC FUN_140a1afa0: a follower graph's +0x788 = her graph, her graph
+    // +0x780 = the latest follower, each follower's +0x780 = the next. Owner = (graph +0x6c0) - 0x128 (EXP-059),
+    // skeleton = owner CHARACTER +0x170 (the field HIERARCHY_MAPPING reads, *(handle+0x30)+0x170). Read only while
+    // she is not herself synced to another graph (riding), when +0x780 is her place in the horse's list instead.
+    const void* syncedProps[8]{};
+    uint32_t syncedPropCount = 0;
     // Her physics character controller is attached (CHARACTER+0x508, see the header comment). EXP-060: story cutscenes
     // run with it detached; interaction animations (the 2003 corral, mounting) keep it.
     bool physics = false;

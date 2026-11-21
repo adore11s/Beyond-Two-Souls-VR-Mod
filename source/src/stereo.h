@@ -54,6 +54,12 @@ int GetMethod();
 void SetMethod(int method);
 const char* MethodName(int method);
 
+// Third-person camera closer (VR settings panel, 1.0.3): metres the game's own camera moves forward along its
+// horizontal view direction while no first-person mode drives the view (0 .. 2, never closer than 0.75 m in front of
+// the character). b2svr.ini camera_forward, saved by the setter.
+float CameraPush();
+void SetCameraPush(float metres);
+
 // devctl verbs: "stereo on|off", "ipd <m>", "suppress on|off", "sshot <name>", "xr on|off", "recenter".
 bool Command(const char* verb, const char* arg);
 

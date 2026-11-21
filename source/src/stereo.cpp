@@ -7,7 +7,9 @@
 #include <MinHook.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,7 +29,9 @@
 #include "videowatch.h"
 #include "log.h"
 #include "posemath.h"
+#include "player.h"
 #include "rendersize.h"
+#include "welcome.h"
 #include "devtools.h"
 #include "storyvars.h"
 #include "texguard.h"
@@ -297,7 +301,7 @@ std::atomic<void*> g_curCmdbuf{nullptr};
 std::atomic<uint32_t> g_skipStages{0};
 constexpr int kStageReflection = 11;  // 0x140889860 "DisplayReflection"
 constexpr int kStageMirrors = 13;     // 0x1408895b0 "DisplayMirrors"
-
+constexpr int kStageProbes = 3;       // 0x140889c60: CAMERA_TEXTURE updates (FUN_1408961b0 -> FUN_140942840)
 // EXP-050 diagnostic (`reflprobe <n>`): the next n DisplayReflection stages log the eye, the frame key and the flag
 // word that gates the planar reflection. STATIC: FUN_140867350 / FUN_140867650 draw / gather it only when bit 9 of
 // *(*(layer + 0x50) + 0x30) + 0x44 is set, layer = the display layer being drawn (0x141c79008, set by
@@ -500,13 +504,222 @@ void BudgetProbe(const char* at) {
 constexpr int kStageGbufferCull = 9;     // 0x140889a20 -> FUN_14086b090 -> FUN_140896350 (G-buffer visibility)
 constexpr int kStageGbufferGather = 12;  // 0x140889770 -> FUN_14086ab10 -> FUN_140896460 (SCENE_GRAPH::FillGBuffer)
 
+// 1.0.3 (owner: "the reflections move around with your head; if you don't move your head it is fine"). STATIC
+// (EXP-065 s.6): the mirror visibility query FUN_140991010 (called for each viewport from FUN_14086b540 ->
+// FUN_1408678b0 in the pass's first stage) builds each visible mirror's view by reflecting the eye's published view
+// (0x141c8f100) across the mirror plane (FUN_1402c45e0, plane at mirror +0x150) into vp+0x1b0 + i*0x40, after moving
+// the old one to vp+0x370 + i*0x40 (the previous view, up to six mirrors). DisplayMirrors (FUN_140869af0) then draws
+// each mirror with that view published as the main set (FUN_14083bed0) and the PREVIOUS one as the second set
+// (FUN_14083b910 -> 0x141c8f240). Both eyes share these slots, so in VR the second set of every mirror is the other
+// eye's mirror view from the pass before - off by the eye distance standing still and by the head's motion while
+// moving: the same stale second camera set EXP-017 found for the main view ("shadows slide when the head turns"),
+// which the mod fixes there by publishing the eye's current view as the second set (set2). Same rule for mirrors: in
+// an eye pass the previous slots take the eye's current mirror views before DisplayMirrors runs. b2svr.ini
+// mirror_prev_view=game keeps the game's slots; dev verb `mirrorprev on|off`.
+std::atomic<bool> g_mirrorPrevFix{true};
+constexpr size_t kMirrorViews = 0x1b0, kMirrorPrevViews = 0x370, kMirrorSlots = 6;
+
+bool CopyMirrorViews(uint8_t* vp) {
+    __try {
+        std::memcpy(vp + kMirrorPrevViews, vp + kMirrorViews, kMirrorSlots * 0x40);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void MirrorPrevToCurrent(void* list) {
+    if (!list) return;
+    const uint32_t count = Read<uint32_t>(list, off::VpListCount);
+    auto** handles = Read<void**>(list, off::VpListArray);
+    int done = 0;
+    for (uint32_t i = 0; handles && i < count && i < 16; ++i) {
+        auto* vp = static_cast<uint8_t*>(ResolveHandle(handles[i]));
+        if (vp && (Read<uint32_t>(vp, off::VpFlags) & 1) && CopyMirrorViews(vp)) ++done;
+    }
+    static int logs = 0;
+    if (done && logs++ < 2)
+        Log("STEREO mirrors: each eye's previous mirror views set to its own (%d viewport(s); mirror_prev_view)", done);
+}
+
+// 1.0.3 diagnostic (owner: mirror reflections in 2605 Clayton House still slide with the head; EXP-065 s.6). Passive
+// and read-only: per eye pass, what the three possible mirror paths use, every 2 s per eye (capped; `mirrordiag on`
+// resets the cap). LIVE first run: no line at all in Clayton House - that version logged portal mirrors only when there
+// were some, and a camera texture only when the round-robin index moved (never with a single probe).
+// - Portal mirrors (DisplayMirrors): the visible mirror count of the viewport's visibility results (scene = camera
+//   +0x78 -> +0x30; vis = *(scene+0x190) -> +0x60; block = **(vis + 0x70 + idx*8), idx = vis+0x60; count = block+0x38,
+//   at most 6, FUN_140991010), each mirror's reflected camera position (inverse of vp+0x1b0 + i*0x40) and screen
+//   rectangle (vp+0x500 + i*0x10), and the eye's own position (camera +0x280 view).
+// - CAMERA_TEXTURE probes (stage 0x140889c60 -> FUN_1408961b0): the scene's probe list (+0x178 / +0x180, round-robin
+//   index +0x188); a probe renders when its viewport stamp (+0x140 -> +8) >= frame - 1; its node position (+0xa0 ->
+//   world +0x80) and FOV (+0x104, degrees).
+std::atomic<bool> g_mirrorDiag{true};
+std::atomic<int> g_mirrorDiagLines{0};
+constexpr int kMirrorDiagMax = 900;
+
+template <class T>
+bool DiagRd(const void* p, size_t off, T* out) {
+    if (!p) return false;
+    __try {
+        std::memcpy(out, static_cast<const uint8_t*>(p) + off, sizeof(T));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+uint8_t* DiagScene(uint8_t* vp) {
+    void* camH = nullptr;
+    if (!DiagRd(vp, off::VpCamera, &camH) || !camH) return nullptr;
+    auto* cam = static_cast<uint8_t*>(ResolveHandle(camH));
+    uint8_t* sceneH = nullptr;
+    uint8_t* scene = nullptr;
+    if (!cam || !DiagRd(cam, 0x78, &sceneH) || !sceneH || !DiagRd(sceneH, 0x30, &scene)) return nullptr;
+    return scene;
+}
+
+// The display layer's settings (*(*(0x141c79008) + 0x50) + 0x30): +0x44 bit 9 = planar reflection (DisplayReflection),
+// bit 20 = portal mirrors (DisplayMirrors), bit 21 = mirrors inside camera textures; +0x98 = camera textures on.
+uint8_t* DiagSettings() {
+    const uintptr_t va = game::Va(0x141c79008);
+    uint8_t *layer = nullptr, *h = nullptr, *settings = nullptr;
+    if (!va || !DiagRd(reinterpret_cast<void*>(va), 0, &layer) || !DiagRd(layer, 0x50, &h) || !DiagRd(h, 0x30, &settings))
+        return nullptr;
+    return settings;
+}
+
+// Camera position (world) of a row-vector view matrix.
+bool ViewPos(const float* v, float out[3]) {
+    float m[16];
+    __try {
+        std::memcpy(m, v, sizeof(m));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    for (int j = 0; j < 3; ++j) out[j] = -(m[12] * m[j * 4 + 0] + m[13] * m[j * 4 + 1] + m[14] * m[j * 4 + 2]);
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
+// Once per eye pass every 2 s (per eye), whatever is in view: portal mirrors, the settings bits and the room's
+// reflection plane (FUN_14092e5e0 writes the zone's plane into the viewport block vp+0x60; plane at vp+0xa0).
+void MirrorDiag(void* list) {
+    if (!list || g_mirrorDiagLines.load() >= kMirrorDiagMax) return;
+    const int eye = g_recordingEye.load();
+    const int e = eye == 1 ? 1 : 0;
+    static ULONGLONG lastAt[2] = {};
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastAt[e] < 2000) return;
+    lastAt[e] = now;
+    uint32_t flags = 0;
+    uint8_t ctOn = 0;
+    if (uint8_t* st = DiagSettings()) {
+        DiagRd(st, 0x44, &flags);
+        DiagRd(st, 0x98, &ctOn);
+    }
+    const uint32_t count = Read<uint32_t>(list, off::VpListCount);
+    auto** handles = Read<void**>(list, off::VpListArray);
+    for (uint32_t i = 0; handles && i < count && i < 8; ++i) {
+        auto* vp = static_cast<uint8_t*>(ResolveHandle(handles[i]));
+        if (!vp || !(Read<uint32_t>(vp, off::VpFlags) & 1)) continue;
+        uint8_t* scene = DiagScene(vp);
+        uint8_t *visH = nullptr, *vis = nullptr, *holder = nullptr, *block = nullptr;
+        uint32_t idx = 0, mirrors = 0;
+        const bool chain = scene && DiagRd(scene, 0x190, &visH) && DiagRd(visH, 0x60, &vis) && DiagRd(vis, 0x60, &idx) &&
+                           idx <= 8 && DiagRd(vis, 0x70 + size_t(idx) * 8, &holder) && DiagRd(holder, 0, &block) &&
+                           DiagRd(block, 0x38, &mirrors);
+        char line[640];
+        int len = snprintf(line, sizeof(line),
+                           "MIRRORDIAG eye=%d vp=%p scene=%p settings=0x%08x (refl=%d mirrors=%d ctMirrors=%d camtex=%d) "
+                           "portal=%s%u",
+                           eye, vp, scene, flags, int(flags >> 9 & 1), int(flags >> 20 & 1), int(flags >> 21 & 1),
+                           int(ctOn), chain ? "" : "?", mirrors);
+        float plane[4] = {};
+        DiagRd(vp, 0xa0, &plane);
+        len += snprintf(line + len, sizeof(line) - len, " plane=(%.3f %.3f %.3f %.3f)", plane[0], plane[1], plane[2],
+                        plane[3]);
+        void* camH = nullptr;
+        float eyePos[3] = {};
+        if (DiagRd(vp, off::VpCamera, &camH))
+            if (auto* cam = static_cast<uint8_t*>(ResolveHandle(camH)))
+                if (ViewPos(reinterpret_cast<const float*>(cam + off::CamView), eyePos))
+                    len += snprintf(line + len, sizeof(line) - len, " eye=(%.3f %.3f %.3f)", eyePos[0], eyePos[1], eyePos[2]);
+        const uint32_t n = mirrors < 6 ? mirrors : 6;
+        for (uint32_t m = 0; m < n && len < 540; ++m) {
+            float p[3] = {}, r[4] = {};
+            ViewPos(reinterpret_cast<const float*>(vp + 0x1b0 + m * 0x40), p);
+            DiagRd(vp, 0x500 + m * 0x10, &r);
+            len += snprintf(line + len, sizeof(line) - len, " | m%u cam=(%.3f %.3f %.3f) rect=(%.2f %.2f %.2f %.2f)", m, p[0],
+                            p[1], p[2], r[0], r[1], r[2], r[3]);
+        }
+        if (g_mirrorDiagLines.fetch_add(1) < kMirrorDiagMax) Log("%s", line);
+    }
+}
+
+// Before the CAMERA_TEXTURE stage, every 2 s per eye: the scene's probe list (+0x178 array, +0x180 count, +0x188
+// round-robin index; a probe renders when its viewport stamp (+0x140 -> +8) >= frame - 1), each probe's node position
+// (+0xa0 -> world +0x80, translation +0xb0), FOV (+0x104, degrees), size (+0x130) and on flag (+0x100).
+void ProbeDiag(void* list) {
+    if (!list || g_mirrorDiagLines.load() >= kMirrorDiagMax) return;
+    const int e = g_recordingEye.load() == 1 ? 1 : 0;
+    static ULONGLONG lastAt[2] = {};
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastAt[e] < 2000) return;
+    lastAt[e] = now;
+    uint32_t frame = 0;
+    if (const uintptr_t rs = game::Va(0x141c78958)) {
+        uint8_t* rsp = nullptr;
+        if (DiagRd(reinterpret_cast<void*>(rs), 0, &rsp)) DiagRd(rsp, 0xBF4, &frame);
+    }
+    const uint32_t count = Read<uint32_t>(list, off::VpListCount);
+    auto** handles = Read<void**>(list, off::VpListArray);
+    for (uint32_t i = 0; handles && i < count && i < 8; ++i) {
+        auto* vp = static_cast<uint8_t*>(ResolveHandle(handles[i]));
+        if (!vp || !(Read<uint32_t>(vp, off::VpFlags) & 1)) continue;
+        uint8_t* scene = DiagScene(vp);
+        uint32_t probes = 0, idx = 0;
+        uint8_t** arr = nullptr;
+        if (!scene || !DiagRd(scene, 0x180, &probes) || !DiagRd(scene, 0x188, &idx) || !DiagRd(scene, 0x178, &arr)) continue;
+        char line[900];
+        int len = snprintf(line, sizeof(line), "MIRRORDIAG camtex eye=%d scene=%p probes=%u idx=%u frame=0x%08x",
+                           g_recordingEye.load(), scene, probes, idx, frame);
+        for (uint32_t k = 0; k < probes && k < 6 && len < 780; ++k) {
+            uint8_t* probe = nullptr;
+            if (!DiagRd(arr, size_t(k) * 8, &probe) || !probe) continue;
+            uint8_t* stampObj = nullptr;
+            uint32_t stamp = 0, size = 0;
+            uint8_t on = 0;
+            DiagRd(probe, 0x140, &stampObj);
+            DiagRd(stampObj, 8, &stamp);
+            DiagRd(probe, 0x130, &size);
+            DiagRd(probe, 0x100, &on);
+            float pos[3] = {}, fov = 0.f;
+            void* nodeH = nullptr;
+            if (DiagRd(probe, 0xa0, &nodeH))
+                if (auto* node = static_cast<uint8_t*>(ResolveHandle(nodeH))) DiagRd(node, 0xb0, &pos);
+            DiagRd(probe, 0x104, &fov);
+            len += snprintf(line + len, sizeof(line) - len, " | #%u %p on=%u live=%d size=%u fov=%.1f node=(%.3f %.3f %.3f)",
+                            k, probe, on, int(stamp >= frame - 1u), size, fov, pos[0], pos[1], pos[2]);
+        }
+        if (g_mirrorDiagLines.fetch_add(1) < kMirrorDiagMax) Log("%s", line);
+    }
+}
+
 template <int I>
 void HookStage(void* a, void* b, void* c, void* d) {
+    if constexpr (I == kStageProbes)
+        if (g_mirrorDiag.load(std::memory_order_relaxed) && g_haveXrEyes.load() && g_recordingEye.load() >= 0)
+            ProbeDiag(a);
+    if constexpr (I == kStageMirrors)
+        if (g_mirrorDiag.load(std::memory_order_relaxed) && g_haveXrEyes.load() && g_recordingEye.load() >= 0)
+            MirrorDiag(a);
     if (g_stageMarks && g_curCmdbuf) EmitMarker(g_curCmdbuf, kStageMarker[I]);
     if constexpr (I == kStageReflection) if (g_reflProbe.load(std::memory_order_relaxed) > 0) {
         g_reflProbe.fetch_sub(1);
         ReflProbe();
     }
+    if constexpr (I == kStageMirrors)
+        if (g_mirrorPrevFix.load(std::memory_order_relaxed) && g_haveXrEyes.load() && g_recordingEye.load() >= 0)
+            MirrorPrevToCurrent(a);
     if (g_skipStages.load() & (1u << I)) return;
     g_origStage[I](a, b, c, d);
     if constexpr (I == kStageGbufferCull || I == kStageGbufferGather)
@@ -1277,6 +1490,11 @@ void HookSkelLighting(void* skeleton) {
 
 }  // namespace
 
+namespace {
+std::atomic<float> g_cameraPush{0.f};  // b2svr.ini camera_forward, metres, 0..kPushMax
+constexpr float kPushMax = 2.f, kPushKeep = 0.75f;
+}  // namespace
+
 void Install() {
     // b2svr.ini next to the game: "xr=on" starts the OpenXR session automatically at launch.
     {
@@ -1291,6 +1509,14 @@ void Install() {
         g_method = _wcsicmp(ini, L"afr") == 0 ? kAfr : _wcsicmp(ini, L"mono") == 0 ? kMono : kNative;
         xr::SetMono(g_method == kMono);
         Log("b2svr.ini: rendering_method=%s", MethodName(g_method));
+        GetPrivateProfileStringW(L"b2svr", L"camera_forward", L"0", ini, MAX_PATH, path.c_str());
+        const float push = static_cast<float>(_wtof(ini));
+        g_cameraPush = std::isfinite(push) ? std::clamp(push, 0.f, kPushMax) : 0.f;
+        Log("b2svr.ini: camera_forward=%.2f m (third-person camera closer)", g_cameraPush.load());
+        GetPrivateProfileStringW(L"b2svr", L"mirror_prev_view", L"eye", ini, MAX_PATH, path.c_str());
+        g_mirrorPrevFix = _wcsicmp(ini, L"game") != 0;
+        Log("b2svr.ini: mirror_prev_view=%ls (mirror reflections %s)", ini,
+            g_mirrorPrevFix.load() ? "use each eye's own previous mirror view" : "keep the game's shared slots");
     }
     HookAllStages(std::make_integer_sequence<int, kStageCount>{});
     {
@@ -1324,6 +1550,7 @@ void Install() {
          reinterpret_cast<void**>(&g_origDisplay2D), "VIEWPORT_LIST::Display2D");
     videowatch::Install();  // full-screen videos in the 2D layer (xr::OnUiEnd)
     rendersize::Install();  // square render size in VR (b2svr.ini render_size)
+    welcome::Install();     // first-start welcome windows: the Enter seam (playbook 11.4)
     audio::Install();       // the sound listener follows the headset (b2svr.ini audio_head)
     storyvars::Install();   // read-only: story variables for crash reports (before the developer tools)
     InstallCullView();
@@ -1437,6 +1664,37 @@ void PrimeViewports(void* list, void* cmdbuf);
 void RefreshViewportSnapshot(uint8_t* vp);  // EXP-049
 std::atomic<bool> g_engineFov{true};  // EXP-016: owner saw culling cut at top/bottom/sides
 void ApplyEngineFov(void* camp);
+// 1.0.3 (owner: "the camera regularly falls outside the walls ... a slider for the camera on the z axis, to be a
+// little closer to the characters"). The game's authored third-person cameras often stand behind a wall that the
+// flat screen's narrow view never shows; the headset's wide view and the head's own movement do. While no first-person
+// base drives the camera (F1 / F3 off or not active), every stereo camera of the frame is moved `camera_forward`
+// metres along the main camera's horizontal view direction (its height is kept: no dipping into floors on a
+// downward shot), never to less than kPushKeep in front of the first-person character (Jodie / the possessed
+// body), and not at all in a menu scene or when the camera looks almost straight down. One world offset per frame
+// (RecordList), so both eyes and every camera of the list move together. Panel row "Camera closer (third person)".
+pose::Vec3 g_pushOffset{};  // game thread: this frame's world offset (0 = none)
+
+pose::Vec3 ThirdPersonPush(const pose::Mat4& world) {
+    const float d = g_cameraPush.load(std::memory_order_relaxed);
+    if (!(d > 0.f)) return {};
+    // Row-vector camera world: row 2 = +Z, the camera looks along -Z.
+    float fx = -world.m[8], fz = -world.m[10];
+    const float fn = std::sqrt(fx * fx + fz * fz);
+    if (fn < 0.3f) return {};  // looking (almost) straight down or up: no horizontal direction to move along
+    fx /= fn;
+    fz /= fn;
+    float push = d;
+    const player::State st = player::Last();
+    float body[16];
+    if (!st.menu && st.jodie && player::BodyWorld(st.jodie, body)) {
+        const float ahead = (body[12] - world.m[12]) * fx + (body[14] - world.m[14]) * fz;
+        if (ahead > 0.f) push = std::min(push, std::max(0.f, ahead - kPushKeep));
+    } else if (st.menu) {
+        return {};
+    }
+    return {fx * push, 0.f, fz * push};
+}
+
 std::atomic<bool> g_nodePass{true};  // EXP-018
 uint8_t* CameraNode(void* cam);
 void SetNodeRelative(uint8_t* node, const pose::Mat4& rel);
@@ -1557,16 +1815,37 @@ void RecordList(ListDisplayFn orig, void* list, void* cmdbuf, uint32_t mode, uin
         if (uint8_t* node = g_mainCam ? CameraNode(g_mainCam) : nullptr) {
             const pose::Mat4 authored = AuthoredCameraWorld(node);
             fpcam::Prepare(node, authored, frameInput);
+            {
+                pose::Mat4 unused;
+                const pose::Vec3 push = fpcam::Base(node, &unused) ? pose::Vec3{} : ThirdPersonPush(authored);
+                const bool had = g_pushOffset.x != 0.f || g_pushOffset.z != 0.f;
+                const bool has = push.x != 0.f || push.z != 0.f;
+                g_pushOffset = push;
+                static int logs = 0;
+                if (had != has && logs++ < 20)
+                    Log("STEREO third-person camera %s (camera_forward %.2f m, this frame %.2f m)",
+                        has ? "moved closer" : "at the game's place", g_cameraPush.load(),
+                        std::sqrt(push.x * push.x + push.z * push.z));
+            }
             // EXP-044: the sound listener gets the head these eyes are rendered from (between the eyes, on the
             // same base as SetNodeRelative: the game camera, or the first-person base).
             if (g_haveXrEyes) {
                 pose::Mat4 base = authored;
-                fpcam::Base(node, &base);
+                if (!fpcam::Base(node, &base)) {
+                    base.m[12] += g_pushOffset.x;
+                    base.m[14] += g_pushOffset.z;
+                }
                 audio::Publish(pose::Mul(CenterRel(), base), authored, true);
                 headPublished = true;
             }
-        } else fpcam::Suspend();
-    } else fpcam::Suspend();
+        } else {
+            fpcam::Suspend();
+            g_pushOffset = {};
+        }
+    } else {
+        fpcam::Suspend();
+        g_pushOffset = {};
+    }
     if (!headPublished) audio::Publish(pose::Identity(), pose::Identity(), false);
     // EXP-016: `ao off` clears the engine's per-viewport AO switch (VIEWPORT+0x890 bit9, checked
     // by FUN_1408695f0 before ComputeAmbientOcclusion) for this recording; restored afterwards.
@@ -1802,6 +2081,13 @@ void RenderThreadTick() {}
 // race (left eye flips ~1 s, right eye always right, `eyesame` hides it). `passsync`: after
 // recording the left-eye pass, emit B2SVR:SYNC and wait for the render thread to reach it.
 
+// The desktop window shows one eye steadily (playbook 08.2): the left eye's last picture, in AFR too (the eye each AFR
+// frame draws alternates, and the window used to show them in turn). Mono draws eye 0 only.
+ID3D11Texture2D* MirrorEye(int slot) {
+    (void)slot;
+    return g_eyeTex[0] ? g_eyeTex[0] : g_eyeTex[1];
+}
+
 bool OnMarker(const char* name) {
     if (std::strcmp(name, "B2SVR:SYNC") == 0) {
         SetEvent(g_syncEvent);
@@ -1819,7 +2105,7 @@ bool OnMarker(const char* name) {
             if (name[8] == 'B')
                 xr::OnUiBegin(slot, g_ctx, g_bb);
             else
-                xr::OnUiEnd(slot, g_ctx, g_bb, g_eyeTex[xr::SingleEye(slot) == 0 ? 0 : 1]);
+                xr::OnUiEnd(slot, g_ctx, g_bb, MirrorEye(slot));
         }
         return true;
     }
@@ -1906,7 +2192,10 @@ void SetNodeRelative(uint8_t* node, const pose::Mat4& rel) {
     }
     pose::Mat4 world;
     std::memcpy(world.m, o->saved, sizeof(world.m));
-    fpcam::Base(node, &world);
+    if (!fpcam::Base(node, &world)) {  // third person: the camera slider's offset (ThirdPersonPush)
+        world.m[12] += g_pushOffset.x;
+        world.m[14] += g_pushOffset.z;
+    }
     const pose::Mat4 m = pose::Mul(rel, world);
     std::memcpy(o->written, m.m, sizeof(m.m));
     std::memcpy(w, m.m, sizeof(m.m));
@@ -2441,7 +2730,7 @@ void BeforePresent() {
     std::lock_guard lock(g_bbMutex);
     if (!g_bb || !g_ctx) return;
     LogFrameStats();
-    if (slot >= 0) xr::OnUiEnd(slot, g_ctx, g_bb, g_eyeTex[xr::SingleEye(slot) == 0 ? 0 : 1]);
+    if (slot >= 0) xr::OnUiEnd(slot, g_ctx, g_bb, MirrorEye(slot));
     // Session start/stop/loss/retry, after this frame's XR work so a shutdown never cuts a
     // frame in half.
     xr::Service(g_dev, g_xrWanted);
@@ -2501,6 +2790,16 @@ void RequestVr(bool on) {
 // g_recordingPass / g_recordingLast), xr begins and ends that pair on its only eye and submits the other eye's
 // last image with the pose it was drawn for. Mono (18.7): the same single pass, always eye 0, which xr made the head
 // centre; xr shows that picture to both eyes. Saved in b2svr.ini rendering_method.
+float CameraPush() { return g_cameraPush.load(); }
+void SetCameraPush(float metres) {
+    metres = std::isfinite(metres) ? std::clamp(metres, 0.f, kPushMax) : 0.f;
+    g_cameraPush = metres;
+    wchar_t v[16];
+    swprintf_s(v, L"%.2f", metres);
+    WritePrivateProfileStringW(L"b2svr", L"camera_forward", v, (GameDir() + L"\\b2svr.ini").c_str());
+    Log("STEREO third-person camera closer -> %.2f m (saved to b2svr.ini camera_forward)", metres);
+}
+
 bool AfrSupported() { return true; }
 int GetMethod() { return g_method.load(); }
 const char* MethodName(int method) {
@@ -2575,10 +2874,10 @@ bool Command(const char* verb, const char* arg) {
         g_nodePass = std::strcmp(arg, "off") != 0;
         Log("STEREO nodepass %s", g_nodePass ? "on" : "off");
     } else if (v == "headoff") {
-        float dy = 0, pitch = 0;
-        if (arg) sscanf_s(arg, "%f %f", &dy, &pitch);
-        xr::SetHeadTestOffset(dy, pitch);
-        Log("STEREO head test offset dy=%.3f pitch=%.1f", dy, pitch);
+        float dy = 0, pitch = 0, yaw = 0, dx = 0;
+        if (arg) sscanf_s(arg, "%f %f %f %f", &dy, &pitch, &yaw, &dx);
+        xr::SetHeadTestOffset(dy, pitch, yaw, dx);
+        Log("STEREO head test offset dy=%.3f pitch=%.1f yaw=%.1f dx=%.3f", dy, pitch, yaw, dx);
     } else if (v == "set2") {
         g_refreshSet2 = std::strcmp(arg, "off") != 0;
         Log("STEREO set2 refresh %s", g_refreshSet2 ? "on" : "off");
@@ -2595,6 +2894,13 @@ bool Command(const char* verb, const char* arg) {
     } else if (v == "ao") {
         g_aoOff = std::strcmp(arg, "off") == 0;
         Log("STEREO ambient occlusion %s", g_aoOff ? "OFF" : "on");
+    } else if (v == "mirrordiag") {
+        g_mirrorDiag = std::strcmp(arg, "off") != 0;
+        g_mirrorDiagLines = 0;
+        Log("STEREO mirror diagnostic %s", g_mirrorDiag ? "on" : "off");
+    } else if (v == "mirrorprev") {
+        g_mirrorPrevFix = std::strcmp(arg, "off") != 0;
+        Log("STEREO mirror previous views per eye %s", g_mirrorPrevFix ? "on" : "off");
     } else if (v == "refl" || v == "mirrors") {
         const uint32_t bit = 1u << (v == "refl" ? kStageReflection : kStageMirrors);
         if (std::strcmp(arg, "off") == 0) g_skipStages |= bit;

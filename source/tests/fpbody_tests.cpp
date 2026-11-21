@@ -138,6 +138,70 @@ int main() {
         Check(bodykind::ChildRules(Family::Unknown,0.34f) && !bodykind::ChildRules(Family::Unknown,0.48f),
               "unknown family: the 0.42 m arm rule (young Jodie 0.34, adult 0.48)");
     }
+    {   // EXP-064: the carried Navajo bucket IW_ACC_UNDEFINED_CROSSSET_EXT_NAVBUCKETB (game file, rest pose): a 26-bone
+        // copy of her skeleton, R_Hand(15) > EA_R_ATTACH01(16, the handle) > bone 17 (the bucket, 15 cm below).
+        const int par[26]{-1,0,1,2,3,0,5,6,7,0,9,10,11,12,13,14,15,16,11,18,19,20,11,22,23,21};
+        const float at[26][3]{{0,.83f,-.017f},{-.075f,.797f,-.017f},{-.075f,.429f,-.017f},{-.075f,.071f,-.036f},
+            {-.075f,.02f,.078f},{.075f,.797f,-.017f},{.075f,.429f,-.017f},{.075f,.071f,-.036f},{.075f,.02f,.078f},
+            {0,.909f,-.017f},{0,.98f,.006f},{0,1.052f,.004f},{-.029f,1.251f,.008f},{-.138f,1.236f,-.017f},
+            {-.315f,1.059f,-.017f},{-.455f,.92f,.097f},{-.455f,.92f,.097f},{-.455f,.77f,.097f},{.029f,1.251f,.008f},
+            {.138f,1.236f,-.017f},{.315f,1.059f,-.017f},{.455f,.92f,.097f},{0,1.306f,-.012f},{0,1.353f,.005f},
+            {0,1.4f,.023f},{.455f,.92f,.097f}};
+        uint32_t parents[26];
+        pose::Mat4 current[26], drawn[26];
+        bool onHers[26];
+        for (int j=0;j<26;++j) {
+            parents[j]=par[j]<0?26u:uint32_t(par[j]);
+            current[j]=At(at[j][0],at[j][1],at[j][2]);
+            onHers[j]=j!=17;          // every bone but the bucket sits on one of hers
+            drawn[j]=current[j];
+        }
+        // the controller hand: her drawn right hand (and the copied handle socket) 20 cm forward, 10 cm up, turned 90 deg
+        // about her up axis at the wrist
+        auto moved=[&](const pose::Mat4& m){
+            const pose::Vec3 w{at[15][0],at[15][1],at[15][2]};
+            pose::Mat4 r=pose::Identity();
+            r.m[0]=0; r.m[2]=-1; r.m[8]=1; r.m[10]=0;            // 90 deg about Y (row vectors)
+            pose::Mat4 out=pose::Mul(pose::Mul(m,At(-w.x,-w.y,-w.z)),r);
+            out=pose::Mul(out,At(w.x,w.y+0.1f,w.z+0.2f));
+            return out;
+        };
+        drawn[15]=moved(current[15]);
+        drawn[16]=moved(current[16]);
+        const uint32_t carried=fpbody::detail::CarryUnmapped(current,parents,onHers,drawn,26);
+        Check(carried==1, "the bucket is the one bone carried");
+        const float dx=drawn[17].m[12]-drawn[16].m[12], dy=drawn[17].m[13]-drawn[16].m[13],
+                    dz=drawn[17].m[14]-drawn[16].m[14];
+        Check(Near(dx,0)&&Near(dy,-0.15f)&&Near(dz,0), "the bucket hangs 15 cm below the drawn handle");
+        Check(Near(drawn[17].m[12],-0.455f)&&Near(drawn[17].m[13],0.87f)&&Near(drawn[17].m[14],0.297f),
+              "the bucket went with the controller hand (not left at its animated place)");
+        Check(Near(drawn[0].m[13],0.83f)&&Near(drawn[24].m[13],1.4f), "bones on hers keep her drawn pose");
+        bool none[26]{};
+        pose::Mat4 still[26];
+        for (int j=0;j<26;++j) still[j]=current[j];
+        Check(fpbody::detail::CarryUnmapped(current,parents,none,still,26)==25 && Near(still[17].m[13],0.77f),
+              "nothing on hers: every bone keeps its own place (roots stay, the rest follow unchanged parents)");
+        // the handle socket is one of the hands: the bucket hangs from it and is not blended with the left hand
+        pose::Mat4 two[26];
+        for (int j=0;j<26;++j) two[j]=current[j];
+        two[15]=drawn[15]; two[16]=drawn[16];
+        fpbody::detail::CarryUnmapped(current,parents,onHers,two,26,16,25);
+        Check(Near(two[17].m[13]-two[16].m[13],-0.15f) && Near(two[17].m[14],0.297f),
+              "two hand sockets: a bone hanging from one hand still follows that hand only");
+    }
+    {   // EXP-064: the extinguisher (two-handed, played in step): hips(0) > R socket(1), L socket(2), hose bones 3, 4 on
+        // the hips between the sockets. Her drawn right hand 30 cm forward, the left where it was.
+        const uint32_t parents[5]{5,0,0,0,0};
+        pose::Mat4 current[5]{At(.5f,.5f,0),At(0,1,0),At(1,1,0),At(.25f,1,0),At(.75f,1,0)};
+        const bool onHers[5]{true,true,true,false,false};
+        pose::Mat4 drawn[5]{current[0],At(0,1,.3f),current[2],current[3],current[4]};
+        pose::Mat4 alone[5]{current[0],drawn[1],current[2],current[3],current[4]};
+        fpbody::detail::CarryUnmapped(current,parents,onHers,alone,5);
+        Check(Near(alone[3].m[14],0) && Near(alone[4].m[14],0), "without the hand pair the hose follows the hips");
+        fpbody::detail::CarryUnmapped(current,parents,onHers,drawn,5,1,2);
+        Check(Near(drawn[3].m[14],0.225f) && Near(drawn[4].m[14],0.075f) && Near(drawn[3].m[12],0.25f),
+              "with the hand pair the hose follows both hands by its place between them");
+    }
     std::printf("fpbody tests: %d failure(s)\n",failures);
     return failures?1:0;
 }

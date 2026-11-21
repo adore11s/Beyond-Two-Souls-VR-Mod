@@ -150,6 +150,11 @@ void ReadSettings() {
                         : _wcsicmp(value, L"hide") == 0 ? fpbody::kHeadHidden
                                                         : fpbody::kHeadHiddenInCutscenes);
     Log("FP head in first person: %s (b2svr.ini fp_head)", fpbody::HeadModeName(fpbody::GetHeadMode()));
+    // EXP-067 (playbook 14.12): fingers on the controllers, from the rig's rest shape.
+    GetPrivateProfileStringW(L"b2svr", L"fp_fingers", L"on", value, 32, path);
+    const bool fingersOn = !(_wcsicmp(value, L"off") == 0 || _wcsicmp(value, L"0") == 0);
+    GetPrivateProfileStringW(L"b2svr", L"fp_fingers_rest_shape", L"on", value, 32, path);
+    fpbody::SetFingers(fingersOn, !(_wcsicmp(value, L"off") == 0 || _wcsicmp(value, L"0") == 0));
     GetPrivateProfileStringW(L"b2svr", L"hand_smoothing", L"on", value, 32, path);
     g_handSmoothing = !(_wcsicmp(value, L"off") == 0 || _wcsicmp(value, L"0") == 0);
     g_handCutoff = number(L"hand_smooth_cutoff", 3.f, 0.1f, 30.f);
@@ -1040,6 +1045,18 @@ void Prepare(void* cameraNode, const pose::Mat4& authoredCamera, const xr::Frame
         plan.handWorld[i] = pose::Mul(grip, g_base);
         plan.trigger[i] = input.hand[i].trigger;
         plan.grip[i] = input.hand[i].squeeze;
+        // EXP-067: a hand reports finger touch once any of its touch sensors has said "touched" (a controller without
+        // touch sensing never does and keeps the resting bases, playbook 14.12).
+        static bool touchSeen[2]{};
+        if (input.hand[i].triggerTouch || input.hand[i].thumbTouch) {
+            if (!touchSeen[i])
+                Log("FINGERS %s controller reports finger touch: point and fist follow the fingers, the thumb the grip",
+                    i ? "right" : "left");
+            touchSeen[i] = true;
+        }
+        plan.triggerTouch[i] = input.hand[i].triggerTouch;
+        plan.thumbTouch[i] = input.hand[i].thumbTouch;
+        plan.touchSeen[i] = touchSeen[i];
     }
     fpbody::Publish(plan);
     g_cutsceneFirstPerson = plan.firstPerson && !plan.turnBody;

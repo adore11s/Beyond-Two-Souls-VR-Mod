@@ -13,12 +13,15 @@ static bool Near(float a, float b, float e = 1e-3f) { return std::fabs(a - b) < 
 
 int main() {
     int fails = 0, checks = 0;
-    // The profile: 1000 x 1690 px, 1.2 m x 2.028 m; the last label at 1402, its buttons end at 1518, then the
-    // three footer lines 1540 .. 1668.
+    // The profile (B2S_ELEVEN_ROW_V6): 1000 x 1690 px, 1.2 m x 2.028 m; the last label at 1402, its buttons end at
+    // 1518, then the three footer lines 1540 .. 1668.
     static_assert(kWidthPx == 1000 && kHeightPx == 1690 && kRows == 11);
     CHECK(Near(kHeightM, 2.028f));
     static_assert(kTop + (kRows - 1) * kRow == 1402 && kTop + (kRows - 1) * kRow + kButtonY + kButtonH == 1518);
     static_assert(kHeightPx - 150 == 1540 && kHeightPx - 22 == 1668);
+    // The camera-closer stepper: Off .. 2 m in 0.25 m steps, clamped at both ends.
+    CHECK(Near(StepPreset(kPushes, 0.f, 1), 0.25f) && Near(StepPreset(kPushes, 0.f, -1), 0.f));
+    CHECK(Near(StepPreset(kPushes, 2.f, 1), 2.f) && Near(StepPreset(kPushes, 0.75f, -1), 0.5f));
 
     // Placement: right of a 2.2 m screen 1.8 m ahead, the gap 0.15 m, turned toward the head.
     const Placement p = Place({0.f, 0.f, -1.8f}, 2.2f, {0.f, 0.f, 0.f});

@@ -14,6 +14,11 @@
 #  fixed list of the mod's own files - never an .exe, never a folder holding one, never the game folder itself or
 #  anything outside it.
 #
+#  As little hassle as possible (VR porting playbook 28.6): what blocks the run (the game running, a missing file, another
+#  mod's dinput8.dll) is checked before any question; a choice takes ONE key (no Enter); only the uninstall itself is
+#  typed (YES + Enter); the game options set are said in one line; a clean run closes by itself after 10 s (any key
+#  closes it at once), and the window waits for a key only when there is something to read (a [!] / [X] line).
+#
 #  Kept ASCII only: Windows PowerShell 5.1 reads a script without a BOM in the ANSI code page.
 # ===========================================================================
 param([ValidateSet('Install', 'Uninstall')][string]$Mode = 'Install')
@@ -27,12 +32,48 @@ $OptionsBackup = Join-Path $ModDir 'game_options_backup.bin'  # the game's optio
 # An older launcher created steam_appid.txt (marked by this file): the uninstaller removes it.
 $AppIdMarker = 'b2svr_steam_appid.created'
 
+$script:NeedRead = $false  # a warning or an error was printed: the window waits for a key before closing
 function Say([string]$t) { Write-Host "   $t" }
-function Warn([string]$t) { Write-Host "   [!] $t" -ForegroundColor Yellow }
-function Bad([string]$t) { Write-Host "   [X] $t" -ForegroundColor Red }
+function Warn([string]$t) { Write-Host "   [!] $t" -ForegroundColor Yellow; $script:NeedRead = $true }
+function Bad([string]$t) { Write-Host "   [X] $t" -ForegroundColor Red; $script:NeedRead = $true }
+function Test-Console {
+    try { return -not [Console]::IsInputRedirected } catch { return $false }
+}
+# One key from a list (no Enter); the key taken is shown after the question. Without a console: a typed answer.
+function Read-Key([string]$question, [string[]]$keys) {
+    if (-not (Test-Console)) {
+        while ($true) {
+            $a = (Read-Host "   $question").Trim()
+            foreach ($k in $keys) { if ($a -ieq $k) { return $k.ToUpper() } }
+        }
+    }
+    Write-Host "   $question " -NoNewline
+    while ($true) {
+        $c = [string][Console]::ReadKey($true).KeyChar
+        foreach ($k in $keys) {
+            if ($c -ieq $k) { Write-Host $k.ToUpper(); return $k.ToUpper() }
+        }
+    }
+}
+# A clean run closes by itself (10 s, any key at once); with something to read it waits for any key.
 function Done([int]$code) {
     Write-Host ''
-    [void](Read-Host '   Press Enter to close')
+    if (-not (Test-Console)) { exit $code }
+    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }
+    if ($script:NeedRead -or $code -ne 0) {
+        Write-Host '   Press any key to close' -NoNewline
+        [void][Console]::ReadKey($true)
+        Write-Host ''
+        exit $code
+    }
+    for ($t = 10; $t -gt 0; $t--) {
+        Write-Host "`r   Closing in $t s - press any key to close now " -NoNewline
+        for ($i = 0; $i -lt 10; $i++) {
+            if ([Console]::KeyAvailable) { [void][Console]::ReadKey($true); Write-Host ''; exit $code }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Write-Host ''
     exit $code
 }
 
@@ -269,17 +310,19 @@ function Restore-Settings([string]$game) {
         Warn 'The game options file is not in the expected form - left alone (set the options yourself in the game).'
         return
     }
+    $back = @()
     foreach ($k in $rec.Keys) {
         if (-not $f.Contains($k)) { continue }
         $orig, $set = Split-Recorded $rec[$k]
         $cur = Get-Field $d $f $k
         if ($null -ne $set -and $cur -eq $set) {  # still what the installer set
             Set-Field $d $f $k $orig
-            if ($k -notmatch '^Quality') { Say "game options: $k back to $(Format-Value $k $orig)" }
+            if ($k -notmatch '^Quality') { $back += "$k $(Format-Value $k $orig)" }
         } elseif ($k -notmatch '^Quality') {
-            Say "game options: $k left at $(Format-Value $k $cur) (changed by you since)"
+            Say "Game option $k left at $(Format-Value $k $cur) (you changed it since)"
         }
     }
+    if ($back.Count -gt 0) { Say ("Game options put back: " + ($back -join ', ')) }
     Write-Options $opt $d
     [void](Send-ToRecycleBin $StateSettings $game)
     [void](Send-ToRecycleBin $OptionsBackup $game)
@@ -291,8 +334,6 @@ function Restore-Settings([string]$game) {
 # that cannot be changed is listed with what to set by hand in the game's options.
 function Set-VrGameSettings([string]$game) {
     $manual = [ordered]@{ 'DisplayMode' = 'Display mode: Windowed'; 'MotionBlur' = 'Motion blur: Off'; 'DepthOfField' = 'Depth of field: Off' }
-    Write-Host ''
-    Say 'GAME OPTIONS FOR VR'
     $want = [ordered]@{ 'DisplayMode' = 0; 'MotionBlur' = 0; 'DepthOfField' = 0 }
     $failed = @()
     $opt = Find-OptionsFile $game
@@ -335,9 +376,10 @@ function Set-VrGameSettings([string]$game) {
             $failed = @($manual.Keys)
         }
     }
-    $done = @($manual.Keys | Where-Object { $failed -notcontains $_ })
-    foreach ($k in $done) { Say "game options: $($manual[$k])" }
-    if ($want.Contains('Preset') -and $failed.Count -eq 0) { Say 'game options: Graphics preset Custom (the same quality as before)' }
+    $short = @{ 'DisplayMode' = 'Windowed'; 'MotionBlur' = 'motion blur off'; 'DepthOfField' = 'depth of field off' }
+    $done = @($manual.Keys | Where-Object { $failed -notcontains $_ } | ForEach-Object { $short[$_] })
+    if ($want.Contains('Preset') -and $failed.Count -eq 0) { $done += 'graphics preset Custom (the same quality)' }
+    if ($done.Count -gt 0) { Say ("Game settings set for VR: " + ($done -join ', ')) }
     if ($failed.Count -gt 0) {
         Write-Host ''
         Warn 'These game options could NOT be changed by the installer.'
@@ -371,7 +413,7 @@ function Set-VrModDefaults([string]$game) {
     $ini = Join-Path $game 'b2svr.ini'
     if (-not (Test-Path -LiteralPath $ini)) {
         Copy-Item -LiteralPath (Join-Path $Files 'b2svr.ini') -Destination $ini
-        Say 'VR settings: first person while walking on, in cutscenes off (b2svr.ini created)'
+        Say 'VR settings: first person while walking on, in cutscenes off, rendering Native (b2svr.ini created)'
         return
     }
     try {
@@ -381,17 +423,18 @@ function Set-VrModDefaults([string]$game) {
             if ($l -match '^\s*installer_defaults\s*=\s*([0-9.]+)') { $done = [double]$Matches[1] }
         }
         if ($done -ge 3) {
-            Say 'VR settings: your own choices kept'
+            Say 'VR settings: your own choices kept (b2svr.ini)'
             return
         }
         while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
         if ($done -lt 1) {
             Set-IniKey $lines 'firstperson' 'on'
             Set-IniKey $lines 'fpcutscenes' 'off'
-            Say 'VR settings: first person while walking on, in cutscenes off'
+            Say 'VR settings: first person while walking on, in cutscenes off, rendering Native'
+        } else {
+            Say 'VR settings: rendering Native (AFR and Mono are in the VR settings panel)'
         }
         Set-IniKey $lines 'rendering_method' 'native'
-        Say 'VR settings: rendering method Native (both eyes every frame; AFR and Mono are in the VR settings panel)'
         for ($i = $lines.Count - 1; $i -ge 0; $i--) {
             if ($lines[$i] -match '^\s*installer_defaults\s*=' -or $lines[$i] -match '^; Set once by the installer') { $lines.RemoveAt($i) }
         }
@@ -409,20 +452,20 @@ if ($Mode -eq 'Install') {
     Banner 'BEYOND: TWO SOULS VR MOD  -  INSTALL'
     $payload = Join-Path $Files 'dinput8.dll'
     if (-not (Test-Path -LiteralPath $payload)) { Bad 'files\dinput8.dll is missing - unzip the mod again.'; Done 1 }
+    if (Test-GameRunning) { Bad 'Beyond: Two Souls is running. Close it, then run this again.'; Done 1 }
     $game = Find-GameDir
     if (-not $game) { Bad 'No Beyond: Two Souls folder found - nothing was changed.'; Done 1 }
     Say "Game folder: $game"
-    if (Test-GameRunning) { Warn 'Beyond: Two Souls is running. Close it, then run this again.'; Done 1 }
+    $dst = Join-Path $game 'dinput8.dll'
+    if ((Test-Path -LiteralPath $dst) -and -not (Test-OurDll $dst)) {
+        Bad 'There is already a dinput8.dll in the game folder that is NOT this mod'
+        Say '(another mod, an ASI loader or an overlay). It was left alone. Move it somewhere else if you want'
+        Say 'this VR mod instead, then run this again.'
+        Done 1
+    }
     Set-Content -LiteralPath $StateGame -Value $game -Encoding UTF8
 
-    $dst = Join-Path $game 'dinput8.dll'
     if (Test-Path -LiteralPath $dst) {
-        if (-not (Test-OurDll $dst)) {
-            Bad 'There is already a dinput8.dll in the game folder that is NOT this mod'
-            Say '(another mod, an ASI loader or an overlay). It was left alone. Move it somewhere else if you want'
-            Say 'this VR mod instead, then run this again.'
-            Done 1
-        }
         if ((Get-FileHash -LiteralPath $dst).Hash -eq (Get-FileHash -LiteralPath $payload).Hash) {
             Say 'dinput8.dll: already installed and up to date'
         } else {
@@ -439,15 +482,14 @@ if ($Mode -eq 'Install') {
     Set-VrModDefaults $game
 
     Write-Host ''
-    Say 'Done. From now on just start Beyond: Two Souls as usual (Steam, Epic or the exe)'
-    Say 'with your headset on - VR starts by itself. You never need to run this again'
-    Say '(only after downloading a new version of the mod).'
-    Say 'Uninstall any time with "Uninstall VR mod.cmd" in this folder.'
+    Say 'Done. Start Beyond: Two Souls as usual with your headset on - VR starts by itself.'
+    Say 'To remove the mod: "Uninstall VR mod.cmd" in this folder.'
     Done 0
 }
 
 if ($Mode -eq 'Uninstall') {
     Banner 'BEYOND: TWO SOULS VR MOD  -  UNINSTALL'
+    if (Test-GameRunning) { Bad 'Beyond: Two Souls is running - close it first, then run this again.'; Done 1 }
     $game = Find-GameDir
     if (-not $game) { Bad 'No Beyond: Two Souls folder found - nothing was changed.'; Done 1 }
     Say "Game folder: $game"
@@ -461,7 +503,6 @@ if ($Mode -eq 'Uninstall') {
     Write-Host ''
     $a = Read-Host '   Type YES and press Enter to uninstall (anything else cancels)'
     if ($a -ne 'YES' -and $a -ne 'yes') { Say 'Cancelled. Nothing was changed.'; Done 0 }
-    if (Test-GameRunning) { Warn 'Beyond: Two Souls is running - close it first, then run this again.'; Done 1 }
     Write-Host ''
 
     $dll = Join-Path $game 'dinput8.dll'
@@ -473,8 +514,8 @@ if ($Mode -eq 'Uninstall') {
 
     Restore-Settings $game
 
-    $k = Read-Host '   Also move b2svr.ini (your VR settings) and the b2svr_logs folder to the Recycle Bin? Type Y'
-    if ($k -eq 'Y' -or $k -eq 'y') {
+    $k = Read-Key 'Also move b2svr.ini (your VR settings) and the b2svr_logs folder to the Recycle Bin? Press Y or N:' @('Y', 'N')
+    if ($k -eq 'Y') {
         foreach ($f in @('b2svr.ini', 'b2svr_logs', 'b2svr.log', 'b2svr.prev.log', 'b2svr_cmd.txt', 'b2svr_cmd.done',
                          'b2svr_camdump.bin', 'b2svr_vpdump.bin')) {
             if (Send-ToRecycleBin (Join-Path $game $f) $game) { Say "$f -> Recycle Bin" }

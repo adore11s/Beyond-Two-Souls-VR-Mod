@@ -52,6 +52,9 @@ int g_method = kAfr;  // the default (0.18.1)
 int GetMethod() { return g_method; }
 void SetMethod(int m) { g_method = m; }
 const char* MethodName(int) { return "preview"; }
+float g_push = 0.5f;
+float CameraPush() { return g_push; }
+void SetCameraPush(float m) { g_push = m; }
 }  // namespace stereo
 }  // namespace b2s
 

@@ -30,7 +30,8 @@ Everything beyond the basics in the [README](README.md).
 - **Aiden's possessions in first person (off by default, not yet tested in the game).** Turn on **Aiden possessions (first person)** in the VR settings (or `fp_possession=on`): while Aiden possesses someone, first person (F1) follows that person instead of Jodie, while you walk them (body turned with you, arms on your controllers with motion controls) and while the game animates them (the view on their head). When the possession ends it goes back to Jodie.
 - **Jodie's models.** The game has four sets of Jodie models (young, 14, 16 and adult). The mod knows which one a scene uses and applies the young-Jodie hand rules only to young Jodie; every other model gets the rules that scale with the size of her arms. When a scene holds more than one set (the Black Sun chapter), her arm length decides.
 - **VR controllers work as a gamepad.** No extra drivers are needed.
-- **VR settings in the headset.** In the game's pause menu a VR settings panel appears beside the screen (see [VR settings panel](#vr-settings-panel)).
+- **VR settings in the headset.** In the game's pause menu, and in the main menu's Options, a VR settings panel appears beside the screen (see [VR settings panel](#vr-settings-panel)).
+- **Welcome windows.** The first time you start this version, three short windows appear a few seconds into the 3D view (usually the main menu): WELCOME, KO-FI SUPPORTER and VR CONTROLS. They follow your view slowly; close each with a controller's trigger on its button, **Enter** or a gamepad's **A / ✕**. They do not come back (`welcome_seen` in `b2svr.ini`).
 - **Sound follows your head.** 3D sounds are heard from where your head is: in third person turning your head turns the sound with it, in first person they come from Jodie's head instead of the game's camera (`audio_head` in `b2svr.ini`).
 - **Steady hands.** In first person the drawn hands are smoothed a little so they do not tremble; fast moves still follow at once, and the game always gets your raw controller movement.
 
@@ -110,7 +111,7 @@ When the game switches to a filtered camera view (for example the security camer
 
 ## VR settings panel
 
-Open the game's pause menu (the menu button, or all four face buttons) and the **VR SETTINGS** panel appears to the right of the screen. Point either controller at an option and pull its trigger; while a controller points at the panel its trigger belongs to the panel, not the game. Every choice is saved in `b2svr.ini` at once.
+Open the game's pause menu (the menu button, or all four face buttons), or **Options** in the main menu, and the **VR SETTINGS** panel appears to the right of the screen. Point either controller at an option and pull its trigger; while a controller points at the panel its trigger belongs to the panel, not the game. Every choice is saved in `b2svr.ini` at once.
 
 | Row | Choices | `b2svr.ini` |
 |---|---|---|
@@ -118,15 +119,15 @@ Open the game's pause menu (the menu button, or all four face buttons) and the *
 | First person (cutscenes) | On / Off (same as F3) | `fpcutscenes` |
 | Aiden possessions (first person) | On: while Aiden possesses someone, first person (F1) follows that person instead of Jodie (walking: body turned with you, arms on your controllers with motion controls; animated by the game: the view on their head). **Off** (the default): first person stays with Jodie | `fp_possession` |
 | Motion controls (first person) | On: your controllers move Jodie's arms. Off: her arms stay animated by the game | `fparms` |
-| Hand smoothing (first person) | On: with motion controls, Jodie's hands do not tremble when you hold still (fast moves still follow at once). Off: raw hands. The game and the gestures always get your raw movement | `hand_smoothing` |
 | Turning (first person) | Smooth / Snap | `turn` |
 | Turning speed / Snap angle | 20 .. 100 % / 15 .. 90 degrees | `turn_speed` / `snap_turn_degrees` |
+| Camera closer (third person) | Off .. 2 m in 0.25 m steps: the game's own camera moves forward toward the characters (its height stays), so it falls outside the walls less often. Never closer than 0.75 m in front of Jodie; first person is not affected | `camera_forward` |
 | Controller buttons | Xbox / PlayStation (same as F10 / F11) | `controller` |
 | VR picture size (per eye) | 1440 .. 2816, then **Auto** (the size your headset asks for). The game resizes at once | `render_size` |
 | Rendering method | **Native**, the default (both eyes every frame) / AFR (one eye per frame, alternating: lighter on the graphics card; the other eye shows its last picture, so fast motion can look less smooth) / Mono (one picture per frame from the middle of your head, shown to both eyes: the fastest, no eye-to-eye differences, but no 3D depth - the world looks far away; for slow graphics cards or a problem that only shows with two eyes) | `rendering_method` |
 | VR on / off | Off = back to your monitor; F9 turns VR on again | — |
 
-The panel shows with the game's pause menu, never over a video. (The main menu is a 3D scene, so it does not show there.)
+The panel shows with the game's pause menu and while the main menu's **Options** page is open, never over a video. Hand smoothing has no row any more: it stays in `b2svr.ini` (`hand_smoothing`).
 
 ---
 
@@ -143,7 +144,11 @@ The panel shows with the game's pause menu, never over a video. (The main menu i
 | `fps` | 0 | Frame rate cap; 0 = none (recommended in VR) |
 | `vsync` | off | Monitor VSync; always off while VR runs |
 | `render_size` | 2048 | VR picture size: a square of this many pixels per side for each eye while VR runs (the VR settings: 1440 / 1728 / 2048 / 2304 / 2560 / 2816 / auto); auto = the size your headset asks for (the larger of its two eye sizes, up to a multiple of 8); off = the game's own resolution. Needs the game in Windowed mode |
-| `desktop_window` | 720 | While the square VR picture runs, the game window on your monitor is this many pixels square (the headset still gets the full picture); 0 = the game's own window size |
+| `desktop_window` | 720 | While VR runs, the game window on your monitor is 16:9 and this many pixels high (720 = 1280 x 720; the headset still gets its full picture). Resize, maximize or snap it as you like: it stays 16:9 and your height is kept in `desktop_window_h`; 0 = the game's own window |
+| `desktop_crop` | 1 | 1 = the 3D view fills the desktop window (top and bottom cut off on the monitor only); 0 = black bars |
+| `camera_forward` | 0 | Third-person camera closer, metres (0 .. 2; the VR settings: Camera closer) |
+| `light_occlusion` | vr | vr = every light glow is drawn in both eyes in VR; game = the game's own visibility test for far lights (can show a glow in one eye only) |
+| `mirror_prev_view` | eye | eye = mirrors and reflections drawn with each eye's own previous view; game = the game's (shared by both eyes: reflections slide when you move your head) |
 | `turn` | smooth | Right-stick turning in first person (F1): smooth or snap |
 | `turn_speed` | 1 | Smooth turning speed: 1 = 120 degrees a second (the VR settings: 0.2 .. 1) |
 | `snap_turn_degrees` | 45 | Snap turning step in degrees (the VR settings: 15 / 30 / 45 / 60 / 90) |
@@ -153,8 +158,10 @@ The panel shows with the game's pause menu, never over a video. (The main menu i
 | `fparms` | on | Motion controls: off = Jodie's arms stay animated by the game in first person |
 | `rendering_method` | native | native = both eyes every frame; afr = one eye per frame, alternating; mono = one picture from the middle of the head for both eyes (the VR settings: Rendering method) |
 | `audio_head` | on | 3D sound heard from your head (off = from the game's camera) |
-| `hand_smoothing` | on | Smooth Jodie's hands with motion controls in first person (off = raw; the VR settings: Hand smoothing); `hand_smooth_cutoff` 3 and `hand_smooth_beta` 6 tune it |
+| `hand_smoothing` | on | Smooth Jodie's hands with motion controls in first person (off = raw); `hand_smooth_cutoff` 3 and `hand_smooth_beta` 6 tune it |
 | `fp_eye_fwd` / `fp_eye_up` | 0.09 / 0.07 | First-person view position in metres, forward of / above the top of Jodie's neck |
+| `fp_fingers` | on | Motion controls in first person: Jodie's fingers follow your grip and trigger, and on controllers with finger touch (Quest Touch, PS VR2 Sense through SteamVR, Index) lifting your index points (the thumb closes with your grip); while she holds an item her fingers play the game's grip (off = one calm pose) |
+| `fp_fingers_rest_shape` | on | Her fingers start from her model's own relaxed hand, so idle and walking animations never move them by themselves (off = from the animation's fingers) |
 | `fp_wrist_pitch` | 0 | Tilts Jodie's hands in first person (degrees; positive = fingers further down) |
 | `wristpitch_psvr2` / `wristpitch_quest` / `wristpitch_other` | `fp_wrist_pitch` | The same tilt for one headset family only (chosen from the headset's name in the log line `FP wrist angle for ...`) |
 | `fp_prompts_on_hand` | on | In first person, words and choices the game shows at Jodie's head appear in front of you (off = where the game puts them) |
@@ -192,7 +199,8 @@ The installer also sets three of the game's own options for VR, in the game's op
 - **First person is still being tuned.** The view height, hand positions and wrist angles may be off in some scenes: adjust them with `fp_eye_fwd`, `fp_eye_up` and `fp_wrist_pitch` (or `wristpitch_<headset>`) in `b2svr.ini`. Press F1 / F3 (or B / ○ at your head) again to go back to the game's cameras at any time.
 - **Cinematic framing.** Some cutscenes keep the game's widescreen framing.
 - **Performance.** Native draws the game twice per frame, AFR and Mono once; if the headset stutters, pick **Mono** (or AFR) or a smaller VR picture size in the VR settings, or lower the game's graphics settings.
-- **The game window on your monitor is small** while VR runs (`desktop_window`, 720 x 720 by default): the headset gets the full square picture, the monitor only a preview.
+- **The game window on your monitor** is 1280 x 720 while VR runs (`desktop_window`); resize it as you like (it stays 16:9). It shows your left eye with the 3D view cropped to fill it; the headset gets the full picture.
+- **Reflections** (mirrors, shiny floors): the fix for reflections sliding when you move your head is not yet checked in a headset; tell me if they still slide.
 
 ---
 
@@ -214,7 +222,7 @@ The mod falls back to the monitor and keeps trying to reconnect every 5 seconds.
 Click the game window (or the SteamVR window) first: the keys only work while one of them is in front. F1 only acts while you control Jodie; it waits through loading screens, menus and Aiden sections. With the controllers, hold your right hand at the side of your head and press B / ○.
 
 **I can't find the VR settings**
-Open the game's pause menu (the menu button, or all four face buttons together and let go): the panel is to the right of the screen. Turn your head to the right if it is outside your view.
+Open the game's pause menu (the menu button, or all four face buttons together and let go) or the main menu's **Options**: the panel is to the right of the screen. Turn your head to the right if it is outside your view.
 
 **The game crashed**
 - A crash report is saved in `b2svr_logs\crash_reports\crash_<date>.txt`: **one file** with everything in it - the report, the mod's whole log of that run and a small memory dump at the end (it lets the developer see exactly where every part of the game was when it crashed).
@@ -222,5 +230,5 @@ Open the game's pause menu (the menu button, or all four face buttons together a
 - Please send that one file, along with a few words on what you were doing (see **Something went wrong?** in README.md).
 
 **The installer shows an error or closes**
-- Take a screenshot of the installer window before pressing Enter and send it.
+- When something went wrong the window stays open: take a screenshot of it before pressing a key, and send it.
 - `It is running` messages: close Beyond: Two Souls first (the game writes its options when it quits).

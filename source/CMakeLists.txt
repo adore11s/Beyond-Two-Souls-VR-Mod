@@ -8,6 +8,15 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 find_package(minhook CONFIG REQUIRED)
 find_package(OpenXR CONFIG REQUIRED)
 
+# The VR panel's and the welcome windows' font (playbook revision 20, V6): Montserrat (SIL Open Font License 1.1,
+# assets/fonts/OFL.txt), built into the DLL as RCDATA 3101 Bold, 3102 SemiBold, 3103 Regular - never a system font.
+set(B2SVR_FONTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gen/fonts.rc"
+  "3101 RCDATA \"${B2SVR_FONTS}/Montserrat-Bold.ttf\"
+3102 RCDATA \"${B2SVR_FONTS}/Montserrat-SemiBold.ttf\"
+3103 RCDATA \"${B2SVR_FONTS}/Montserrat-Regular.ttf\"
+")
+
 # Everything but the developer tools, shared by both DLLs.
 add_library(b2svr_common OBJECT
     src/dllmain.cpp
@@ -38,6 +47,9 @@ add_library(b2svr_common OBJECT
     src/texguard.cpp
     src/ctrlprobe.cpp
     src/storyvars.cpp
+    src/welcome_draw.cpp
+    src/welcome.cpp
+    src/menuwatch.cpp
     src/count_thunks.asm
     src/trace_thunk.asm
 )
@@ -45,7 +57,9 @@ target_compile_definitions(b2svr_common PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNIC
 target_compile_options(b2svr_common PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zi>)
 target_include_directories(b2svr_common PUBLIC src)
 target_link_libraries(b2svr_common PUBLIC minhook::minhook OpenXR::headers OpenXR::openxr_loader
-    d3d11 dxgi bcrypt d3dcompiler gdi32)
+    d3d11 dxgi bcrypt d3dcompiler gdi32 d2d1 dwrite windowscodecs)
+# The fonts go into every DLL built from the common objects (b2svr, b2svr_dev).
+target_sources(b2svr_common INTERFACE "${CMAKE_CURRENT_BINARY_DIR}/gen/fonts.rc")
 
 # The mod players get (the release, ../B2S_VR_MOD): no developer tools (src/devtools_off.cpp, devtools.h).
 add_library(b2svr SHARED src/devtools_off.cpp src/dinput8.def)
@@ -130,6 +144,19 @@ add_executable(fpbody_tests tests/fpbody_tests.cpp)
 target_compile_options(fpbody_tests PRIVATE /W4 /permissive-)
 add_test(NAME fpbody_tests COMMAND fpbody_tests)
 
+# EXP-067: the drawn fingers (src/fingers.h, playbook 14.12) on a rig from the game files.
+add_executable(fingers_tests tests/fingers_tests.cpp)
+target_compile_options(fingers_tests PRIVATE /W4 /permissive-)
+add_test(NAME fingers_tests COMMAND fingers_tests)
+
+# EXP-069 (playbook revision 37, 19.8 point 11 L2 / L5): the carry rules (src/carry.h).
+add_executable(carry_tests tests/carry_tests.cpp)
+target_compile_options(carry_tests PRIVATE /W4 /permissive-)
+add_test(NAME carry_tests COMMAND carry_tests)
+# Desk-only DLL for tools/gate1/l5_replay.py (never shipped): the mod's own carry code behind a C interface.
+add_library(carry_desk SHARED EXCLUDE_FROM_ALL tests/carry_desk.cpp)
+target_include_directories(carry_desk PRIVATE src)
+
 # EXP-056: the game's rig convention (src/rigmap.h).
 add_executable(rigmap_tests tests/rigmap_tests.cpp)
 target_compile_options(rigmap_tests PRIVATE /W4 /permissive-)
@@ -152,10 +179,18 @@ target_include_directories(panel_tests PRIVATE src)
 target_compile_options(panel_tests PRIVATE /W4 /permissive-)
 add_test(NAME panel_tests COMMAND panel_tests)
 # Not a test: renders the panel to panel_preview.bmp for a visual check (game side stubbed).
-add_executable(panel_preview tests/panel_preview.cpp src/panel.cpp)
+add_executable(panel_preview tests/panel_preview.cpp src/panel.cpp src/welcome_draw.cpp "${CMAKE_CURRENT_BINARY_DIR}/gen/fonts.rc")
 target_include_directories(panel_preview PRIVATE src)
 target_compile_definitions(panel_preview PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_link_libraries(panel_preview PRIVATE gdi32)
+target_link_libraries(panel_preview PRIVATE gdi32 d2d1 dwrite windowscodecs)
+# Not a test (playbook 11.4): every welcome window drawn by the mod's own code into docs/visuals/*.png, to look at
+# before a release. Build target welcome_preview, run build/<config>/welcome_preview.exe.
+add_executable(welcome_preview EXCLUDE_FROM_ALL tests/welcome_preview.cpp src/welcome_draw.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/gen/fonts.rc")
+target_include_directories(welcome_preview PRIVATE src)
+target_compile_definitions(welcome_preview PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+    B2SVR_VISUALS_DIR=L"${CMAKE_CURRENT_SOURCE_DIR}/docs/visuals")
+target_link_libraries(welcome_preview PRIVATE windowscodecs ole32 d2d1 dwrite)
 
 add_executable(steam_shadow_tests tests/steam_shadow_tests.cpp)
 target_compile_options(steam_shadow_tests PRIVATE /W4 /permissive-)

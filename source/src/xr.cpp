@@ -19,9 +19,13 @@
 
 #include "hotkeys.h"
 #include "log.h"
+#include "menuwatch.h"
 #include "panel.h"
+#include "welcome.h"
+#include "welcome_draw.h"
 #include "devtools.h"
 #include "posemath.h"
+#include "rendersize.h"
 #include "videowatch.h"
 #include "xr_geometry.h"
 #include "xr_recenter.h"
@@ -52,7 +56,8 @@ std::atomic<bool> g_running{false};  // xrBeginSession done
 std::atomic<bool> g_started{false};
 std::atomic<bool> g_lost{false};  // runtime is exiting / session or instance loss pending
 
-enum class InputAction { Grip, Aim, Stick, Trigger, Squeeze, A, B, StickClick, Menu, Count };
+// TriggerTouch / ThumbTouch (EXP-067, playbook 14.12): the controllers' finger touch sensors for the drawn fingers.
+enum class InputAction { Grip, Aim, Stick, Trigger, Squeeze, A, B, StickClick, Menu, TriggerTouch, ThumbTouch, Count };
 constexpr int kActionCount = int(InputAction::Count);
 XrActionSet g_inputActions = XR_NULL_HANDLE;
 XrAction g_action[kActionCount] = {};
@@ -72,6 +77,8 @@ EyeSwapchain g_eyes[2];
 EyeSwapchain g_quad;  // flat UI / 2D screen panel
 EyeSwapchain g_panelSc, g_cursorSc;  // VR settings panel (panel.h) and its pointer dot
 bool g_panelFilled = false, g_cursorFilled = false;  // their images hold content (reset with the session)
+EyeSwapchain g_welcomeSc;     // first-start welcome windows (welcome.h)
+bool g_welcomeFilled = false;
 EyeSwapchain g_tpSc;          // developer tools overlay (devtools.h)
 bool g_tpFilled = false;      // its image holds content (reset with the session)
 uint64_t g_tpVersion = 0;     // devtools::Overlay::version of the uploaded image
@@ -123,6 +130,7 @@ XrView g_goodViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 // vanished from one eye. Symmetric is the default; `symfov off` restores the runtime's frustum.
 std::atomic<bool> g_symFov{true};
 std::atomic<float> g_headOffY{0.f}, g_headOffPitch{0.f};  // EXP-018 test offsets (m, deg)
+std::atomic<float> g_headOffYaw{0.f}, g_headOffX{0.f};    // 1.0.3 mirror test: head turn (deg), sideways (m)
 bool g_haveGoodViews = false;
 ULONGLONG g_nextGeometryReport = 0;  // game thread; 0 = report on the next tracked frame
 std::atomic<int> g_nextSlot{0};
@@ -232,7 +240,8 @@ bool CreateControllerActions() {
         {"stick", XR_ACTION_TYPE_VECTOR2F_INPUT}, {"trigger", XR_ACTION_TYPE_FLOAT_INPUT},
         {"squeeze", XR_ACTION_TYPE_FLOAT_INPUT}, {"button_a", XR_ACTION_TYPE_BOOLEAN_INPUT},
         {"button_b", XR_ACTION_TYPE_BOOLEAN_INPUT}, {"stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT},
-        {"menu", XR_ACTION_TYPE_BOOLEAN_INPUT}
+        {"menu", XR_ACTION_TYPE_BOOLEAN_INPUT}, {"trigger_touch", XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {"thumb_touch", XR_ACTION_TYPE_BOOLEAN_INPUT}
     };
     for (int i = 0; i < kActionCount; ++i) {
         XrActionCreateInfo ai{XR_TYPE_ACTION_CREATE_INFO};
@@ -244,9 +253,9 @@ bool CreateControllerActions() {
         if (!Check(xrCreateAction(g_inputActions, &ai, &g_action[i]), "create controller action")) return false;
     }
     struct Binding { InputAction action; const char* suffix; int hands = 3; };
-    auto suggest = [&](const char* profile, const Binding* bindings, size_t count) {
+    auto suggest = [&](const char* profile, const Binding* bindings, size_t count) -> XrResult {
         XrPath profilePath = XR_NULL_PATH;
-        if (!XR_SUCCEEDED(xrStringToPath(g_instance, profile, &profilePath))) return;
+        if (!XR_SUCCEEDED(xrStringToPath(g_instance, profile, &profilePath))) return XR_ERROR_PATH_UNSUPPORTED;
         std::vector<XrActionSuggestedBinding> paths;
         for (size_t i = 0; i < count; ++i)
             for (int h = 0; h < 2; ++h) {
@@ -264,6 +273,7 @@ bool CreateControllerActions() {
         // Unsupported suggestions are per-profile failures; other bindings and head tracking remain usable.
         const XrResult r = xrSuggestInteractionProfileBindings(g_instance, &bi);
         Log("XR controller bindings %s: %d (%u)", profile, int(r), bi.countSuggestedBindings);
+        return r;
     };
     const Binding touch[] = {
         {InputAction::Grip, "/input/grip/pose"}, {InputAction::Aim, "/input/aim/pose"},
@@ -271,21 +281,38 @@ bool CreateControllerActions() {
         {InputAction::Squeeze, "/input/squeeze/value"}, {InputAction::StickClick, "/input/thumbstick/click"},
         {InputAction::A, "/input/x/click", 1}, {InputAction::B, "/input/y/click", 1},
         {InputAction::A, "/input/a/click", 2}, {InputAction::B, "/input/b/click", 2},
-        {InputAction::Menu, "/input/menu/click", 1}
+        {InputAction::Menu, "/input/menu/click", 1},
+        // EXP-067 (playbook 14.12): finger touch. SteamVR passes PS VR2 Sense touches on through this profile.
+        {InputAction::TriggerTouch, "/input/trigger/touch"}, {InputAction::ThumbTouch, "/input/thumbstick/touch"},
+        {InputAction::ThumbTouch, "/input/x/touch", 1}, {InputAction::ThumbTouch, "/input/y/touch", 1},
+        {InputAction::ThumbTouch, "/input/a/touch", 2}, {InputAction::ThumbTouch, "/input/b/touch", 2},
+        {InputAction::ThumbTouch, "/input/thumbrest/touch"}
     };
     const Binding index[] = {
         {InputAction::Grip, "/input/grip/pose"}, {InputAction::Aim, "/input/aim/pose"},
         {InputAction::Stick, "/input/thumbstick"}, {InputAction::Trigger, "/input/trigger/value"},
         {InputAction::Squeeze, "/input/squeeze/value"}, {InputAction::StickClick, "/input/thumbstick/click"},
-        {InputAction::A, "/input/a/click"}, {InputAction::B, "/input/b/click"}
+        {InputAction::A, "/input/a/click"}, {InputAction::B, "/input/b/click"},
+        {InputAction::TriggerTouch, "/input/trigger/touch"}, {InputAction::ThumbTouch, "/input/thumbstick/touch"},
+        {InputAction::ThumbTouch, "/input/a/touch"}, {InputAction::ThumbTouch, "/input/b/touch"},
+        {InputAction::ThumbTouch, "/input/trackpad/touch"}
     };
     const Binding simple[] = {
         {InputAction::Grip, "/input/grip/pose"}, {InputAction::Aim, "/input/aim/pose"},
         {InputAction::Trigger, "/input/select/click"}, {InputAction::Menu, "/input/menu/click"}
     };
     // SteamVR may map Sense controllers onto a supported profile; do not invent a Sony path.
-    suggest("/interaction_profiles/oculus/touch_controller", touch, std::size(touch));
-    suggest("/interaction_profiles/valve/index_controller", index, std::size(index));
+    // A runtime that refuses one path refuses the whole profile: then the profile is suggested again without the
+    // finger touches (the fingers take the resting bases there).
+    constexpr size_t kTouchFingerBindings = 7, kIndexFingerBindings = 5;
+    if (!XR_SUCCEEDED(suggest("/interaction_profiles/oculus/touch_controller", touch, std::size(touch)))) {
+        Log("XR controller bindings: Touch profile again without finger touch");
+        suggest("/interaction_profiles/oculus/touch_controller", touch, std::size(touch) - kTouchFingerBindings);
+    }
+    if (!XR_SUCCEEDED(suggest("/interaction_profiles/valve/index_controller", index, std::size(index)))) {
+        Log("XR controller bindings: Index profile again without finger touch");
+        suggest("/interaction_profiles/valve/index_controller", index, std::size(index) - kIndexFingerBindings);
+    }
     suggest("/interaction_profiles/khr/simple_controller", simple, std::size(simple));
     for (int h = 0; h < 2; ++h) {
         XrActionSpaceCreateInfo ai{XR_TYPE_ACTION_SPACE_CREATE_INFO};
@@ -411,6 +438,16 @@ void SampleControllers(XrTime time, const Mat4& refInv, FrameInput& input) {
         hand.b = button(InputAction::B);
         hand.stickClick = button(InputAction::StickClick);
         hand.menu = button(InputAction::Menu);
+        // Finger touch (EXP-067): `touchBound` = the runtime has a touch sensor bound for this hand.
+        gi.action = g_action[int(InputAction::TriggerTouch)];
+        XrActionStateBoolean tt{XR_TYPE_ACTION_STATE_BOOLEAN};
+        const bool ttOk = XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi, &tt)) && tt.isActive;
+        gi.action = g_action[int(InputAction::ThumbTouch)];
+        XrActionStateBoolean th{XR_TYPE_ACTION_STATE_BOOLEAN};
+        const bool thOk = XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi, &th)) && th.isActive;
+        hand.triggerTouch = ttOk && tt.currentState;
+        hand.thumbTouch = thOk && th.currentState;
+        hand.touchBound = ttOk || thOk;
     }
     if (g_state != XR_SESSION_STATE_FOCUSED) {
         input.focused = false;
@@ -428,9 +465,13 @@ void CopyFrameReference(Mat4& refInv, XrPosef& refPose, uint32_t& epoch) {
     }
     // EXP-018 applies the same diagnostic reference offset to head, hands and eyes.
     const float dy = g_headOffY.load(), pitch = g_headOffPitch.load() * 0.0174533f;
-    if (dy != 0.f || pitch != 0.f) {
-        const XrQuaternionf q{std::sin(pitch * 0.5f), 0.f, 0.f, std::cos(pitch * 0.5f)};
-        refInv = Mul(refInv, FromPose(q, XrVector3f{0.f, -dy, 0.f}));
+    const float yaw = g_headOffYaw.load() * 0.0174533f, dx = g_headOffX.load();
+    if (dy != 0.f || pitch != 0.f || yaw != 0.f || dx != 0.f) {
+        // yaw (about up) after pitch (about right): q = qYaw * qPitch
+        const float px = std::sin(pitch * 0.5f), pw = std::cos(pitch * 0.5f);
+        const float yy = std::sin(yaw * 0.5f), yw = std::cos(yaw * 0.5f);
+        const XrQuaternionf q{yw * px, yy * pw, -yy * px, yw * pw};
+        refInv = Mul(refInv, FromPose(q, XrVector3f{-dx, -dy, 0.f}));
     }
 }
 
@@ -854,19 +895,21 @@ bool Start(ID3D11Device* device) {
 
     g_recommendedW = std::max(vcv[0].recommendedImageRectWidth, vcv[1].recommendedImageRectWidth);
     g_recommendedH = std::max(vcv[0].recommendedImageRectHeight, vcv[1].recommendedImageRectHeight);
-    for (int e = 0; e < 6; ++e) {
+    for (int e = 0; e < 7; ++e) {
         if (e == 5 && !devtools::Available()) continue;  // no overlay swapchain in the release build
-        EyeSwapchain& s = e < 2 ? g_eyes[e] : e == 2 ? g_quad : e == 3 ? g_panelSc : e == 4 ? g_cursorSc : g_tpSc;
+        EyeSwapchain& s = e < 2 ? g_eyes[e] : e == 2 ? g_quad : e == 3 ? g_panelSc : e == 4 ? g_cursorSc : e == 5 ? g_tpSc
+                                                                                                         : g_welcomeSc;
         XrSwapchainCreateInfo sc{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         sc.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         sc.format = format;
         sc.sampleCount = 1;
-        const int32_t sizes[6][2] = {{int32_t(vcv[0].recommendedImageRectWidth), int32_t(vcv[0].recommendedImageRectHeight)},
+        const int32_t sizes[7][2] = {{int32_t(vcv[0].recommendedImageRectWidth), int32_t(vcv[0].recommendedImageRectHeight)},
                                      {int32_t(vcv[1].recommendedImageRectWidth), int32_t(vcv[1].recommendedImageRectHeight)},
                                      {1920, 1080},
                                      {panel::kWidthPx, panel::kHeightPx},
                                      {panel::kCursorPx, panel::kCursorPx},
-                                     {devtools::kOverlayWidthPx, devtools::kOverlayHeightPx}};
+                                     {devtools::kOverlayWidthPx, devtools::kOverlayHeightPx},
+                                     {welcome::kWW, welcome::kWH}};
         sc.width = s.width = sizes[e][0];
         sc.height = s.height = sizes[e][1];
         sc.faceCount = sc.arraySize = sc.mipCount = 1;
@@ -891,7 +934,7 @@ bool Start(ID3D11Device* device) {
             s.rtvs.push_back(rtv);
         }
     }
-    g_panelFilled = g_cursorFilled = g_tpFilled = false;
+    g_panelFilled = g_cursorFilled = g_tpFilled = g_welcomeFilled = false;
     {
         std::lock_guard lock(g_keptMutex);
         g_kept[0] = g_kept[1] = KeptEye{};
@@ -918,13 +961,13 @@ void Shutdown(const char* why) {
     g_frameOpen = false;
     g_beginPending = false;
     for (auto& p : g_packets) p.valid = false;
-    g_panelFilled = g_cursorFilled = g_tpFilled = false;
+    g_panelFilled = g_cursorFilled = g_tpFilled = g_welcomeFilled = false;
     panel::Hidden();
     {
         std::lock_guard lock(g_keptMutex);
         g_kept[0] = g_kept[1] = KeptEye{};
     }
-    for (EyeSwapchain* s : {&g_eyes[0], &g_eyes[1], &g_quad, &g_panelSc, &g_cursorSc, &g_tpSc}) {
+    for (EyeSwapchain* s : {&g_eyes[0], &g_eyes[1], &g_quad, &g_panelSc, &g_cursorSc, &g_tpSc, &g_welcomeSc}) {
         for (auto* rtv : s->rtvs)
             if (rtv) rtv->Release();
         s->rtvs.clear();
@@ -1009,9 +1052,11 @@ void RequestFlatShot() { g_flatShotRequest = true; }
 void SetUiTestPattern(int mode) { g_uiTestPattern = mode; }
 void SetUiAlphaMode(int mode) { g_uiAlphaMode = mode == 2 ? 2 : 3; }
 void SetSymmetricFov(bool on) { g_symFov = on; }
-void SetHeadTestOffset(float dy, float pitchDeg) {
+void SetHeadTestOffset(float dy, float pitchDeg, float yawDeg, float dx) {
     g_headOffY = dy;
     g_headOffPitch = pitchDeg;
+    g_headOffYaw = yawDeg;
+    g_headOffX = dx;
 }
 
 // Session log (xr_geometry.h): each eye relative to the head as the runtime reports it, what is
@@ -1168,6 +1213,7 @@ int BeginGameFrame(EyeView eyes[2], FrameInput* input) {
         eyes[e].tanDown = std::tan(v.fov.angleDown);
     }
     p.onlyEye = -1;
+    p.input = input ? *input : FrameInput{};  // the panel / welcome windows of this pair point with it (render thread)
     p.valid = true;
     g_beginPending = true;
     return slot;
@@ -1190,6 +1236,7 @@ bool IsMono(int slot) { return slot >= 0 && slot < kSlots && g_packets[slot].mon
 void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool sceneHidden = false,
                         ID3D11DeviceContext* ctx = nullptr);
 bool TeleportLayer(ID3D11DeviceContext* ctx, const XrPosef& ref, XrCompositionLayerQuad* out);
+int StereoOverlayLayers(ID3D11DeviceContext* ctx, const Packet& p, bool sceneHidden, XrCompositionLayerQuad out[2]);
 
 namespace {
 // Diagnostic (owner 0.16.27: "in F3, going through doors the whole screen goes black for a second";
@@ -1367,10 +1414,14 @@ void EndFrameWithLayers(Packet& p, const XrCompositionLayerQuad* quad, bool scen
         const bool panelOnly = sceneHidden && quad;
         XrCompositionLayerQuad tp;
         const bool haveTp = ctx && p.shouldRender && TeleportLayer(ctx, p.refPose, &tp);
-        const XrCompositionLayerBaseHeader* layers[3] = {};
+        // 1.0.3: the first-start welcome windows (11.4) or, at the main menu's Options page, the VR panel (10.6).
+        XrCompositionLayerQuad overlay[2];
+        const int overlays = ctx && p.shouldRender ? StereoOverlayLayers(ctx, p, sceneHidden, overlay) : 0;
+        const XrCompositionLayerBaseHeader* layers[6] = {};
         uint32_t count = 0;
         if (!panelOnly) layers[count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
         if (quad) layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(quad);
+        for (int i = 0; i < overlays; ++i) layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&overlay[i]);
         if (haveTp) layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&tp);
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = p.displayTime;
@@ -1652,7 +1703,20 @@ void OnUiEnd(int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID
         if (p.shouldRender) haveQuad = FillQuad(ctx, g_uiTex, g_uiTestPattern || video ? 0 : g_uiAlphaMode.load());
         // Restore the flat mirror: the last eye's scene, then the UI composited on top.
         if (ID3D11RenderTargetView* rtv = BackbufferRtv(backbuffer)) {
-            if (eyeImage) Blit(ctx, eyeImage, 0, d.Height, rtv, int(d.Width), int(d.Height), 0, false, false);
+            // 1.0.3 (playbook 08.4): in the 16:9 desktop window the square scene is cropped to its middle band (the
+            // DXGI stretch then gives it its shape back, no black bars); the UI below is the game's 16:9 canvas stretched
+            // over the square, so it is drawn whole and shows at its own shape.
+            float v0 = 0.f, v1 = 1.f;
+            const xrgeom::UvRect crop{0.f, 0.f, 1.f, 1.f};
+            xrgeom::UvRect band = crop;
+            const bool cropped = rendersize::DesktopCrop(d.Width, d.Height, &v0, &v1);
+            if (cropped) {
+                band.v0 = v0;
+                band.v1 = v1;
+            }
+            if (eyeImage)
+                Blit(ctx, eyeImage, 0, d.Height, rtv, int(d.Width), int(d.Height), 0, false, false, 0.f, 0.f,
+                     cropped ? &band : nullptr);
             Blit(ctx, g_uiTex, 0, d.Height, rtv, int(d.Width), int(d.Height), 2, true, false);
         }
     }
@@ -1670,6 +1734,7 @@ void OnUiEnd(int slot, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID
 // ---- VR settings panel (panel.h) ----
 ID3D11Texture2D* g_panelTex = nullptr;  // GDI pixels (B8G8R8A8), blitted into the panel swapchain
 ID3D11Texture2D* g_cursorTex = nullptr;
+ID3D11Texture2D* g_welcomeTex = nullptr;
 
 bool UploadQuadImage(ID3D11DeviceContext* ctx, EyeSwapchain& sc, ID3D11Texture2D*& tex, const uint32_t* pixels, int w,
                      int h, int alphaMode) {
@@ -1771,12 +1836,59 @@ int PanelLayers(ID3D11DeviceContext* ctx, const FrameInput& in, const XrPosef& r
     return n;
 }
 
+// A stereo (3D) frame's own quads: the welcome window and its pointer while one is up (they take the controllers), else
+// the VR panel while the main menu's Options page is open (menuwatch.h; the main menu is a 3D scene, so its Options
+// never reach FlatFrame). A full-screen video (sceneHidden) counts as a 2D screen for the welcome windows.
+int StereoOverlayLayers(ID3D11DeviceContext* ctx, const Packet& p, bool sceneHidden, XrCompositionLayerQuad out[2]) {
+    if (sceneHidden) {
+        welcome::FlatFrame();
+        panel::Hidden();
+        return 0;
+    }
+    welcome::Layer wl;
+    if (g_welcomeSc.handle && welcome::Frame(p.input, &wl)) {
+        panel::Hidden();
+        if ((wl.dirty || !g_welcomeFilled) && wl.pixels &&
+            UploadQuadImage(ctx, g_welcomeSc, g_welcomeTex, wl.pixels, welcome::kWW, welcome::kWH, 1))
+            g_welcomeFilled = true;
+        if (!g_welcomeFilled) return 0;
+        int n = 0;
+        XrCompositionLayerQuad& q = out[n++];
+        q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied, rounded corners
+        q.space = g_local;
+        q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        q.subImage.swapchain = g_welcomeSc.handle;
+        q.subImage.imageRect = {{0, 0}, {g_welcomeSc.width, g_welcomeSc.height}};
+        q.pose = RefToLocal(p.refPose, wl.center, wl.yaw);
+        q.size = {wl.widthM, wl.heightM};
+        if (wl.cursor) {
+            if (!g_cursorFilled && UploadQuadImage(ctx, g_cursorSc, g_cursorTex, panel::CursorPixels(), panel::kCursorPx,
+                                                   panel::kCursorPx, 1))
+                g_cursorFilled = true;
+            if (g_cursorFilled) {
+                XrCompositionLayerQuad& c = out[n++];
+                c = q;
+                c.subImage.swapchain = g_cursorSc.handle;
+                c.subImage.imageRect = {{0, 0}, {g_cursorSc.width, g_cursorSc.height}};
+                c.pose = RefToLocal(p.refPose, wl.cursorAt, wl.yaw);
+                c.size = {wl.cursorSize, wl.cursorSize};
+            }
+        }
+        return n;
+    }
+    if (menuwatch::OptionsOpen() && FrameInputUsable(p.input, GetTickCount64())) return PanelLayers(ctx, p.input, p.refPose, out);
+    panel::Hidden();
+    return 0;
+}
+
 bool FlatFrame(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, ID3D11Texture2D* const lastEyes[2],
                bool showPanel, FrameInput* input) {
     if (input) *input = FrameInput{};
     if (!g_started) return false;
     HandleEvents();
     if (!g_running) return false;
+    welcome::FlatFrame();  // 11.4: a 2D screen hides the welcome window; the 3 s count starts again
     if (g_frameOpen) {  // a stereo pair that never finished: close it empty
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = g_lastWaitTime;

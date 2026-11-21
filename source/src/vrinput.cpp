@@ -13,6 +13,7 @@
 #include "log.h"
 #include "panel.h"
 #include "steam_shadow.h"
+#include "welcome.h"
 
 namespace b2s::vrinput {
 namespace {
@@ -140,11 +141,16 @@ int HookConnected(void* context, uint64_t* handles) {
 void HookActivate(void* context, uint64_t handle, uint64_t set) {
     if (!Synthetic(context,handle)) g_activate(context,handle,set);
 }
+// A real pad's A / Cross as the game reads it ("button_a": the game's own action names, kDigitalNames): the welcome
+// windows close with it, and keep it from the game while they take it (playbook 11.4, GoW D-331).
+std::atomic<uint64_t> g_realConfirm{0};
 uint64_t HookDigitalHandle(void* context, const char* name) {
     if (g_virtualConstructor && context==g_context && name)
         for (size_t i=0;i<std::size(kDigitalNames);++i)
             if (std::strcmp(name,kDigitalNames[i])==0) return kDigitalBase+i+1;
-    return g_digitalHandle(context,name);
+    const uint64_t h = g_digitalHandle(context,name);
+    if (name && context==g_context && std::strcmp(name,"button_a")==0 && h) g_realConfirm = h;
+    return h;
 }
 uint64_t HookAnalogHandle(void* context, const char* name) {
     if (g_virtualConstructor && context==g_context && name) {
@@ -179,7 +185,15 @@ bool Button(const LegacyState& state, uint64_t action) {
     }
 }
 DigitalData* HookDigital(void* context, DigitalData* output, uint64_t handle, uint64_t action) {
-    if (!Synthetic(context,handle)) return g_digital(context,output,handle,action);
+    if (!Synthetic(context,handle)) {
+        DigitalData* r = g_digital(context,output,handle,action);
+        const uint64_t confirm = g_realConfirm.load(std::memory_order_relaxed);
+        if (r && confirm && action==confirm && context==g_context) {
+            welcome::NotePadConfirm(r->state != 0);
+            if (welcome::TakesPadConfirm()) r->state = 0;
+        }
+        return r;
+    }
     g_digitalQueries.fetch_add(1, std::memory_order_relaxed);
     const bool pressed = Button(Snapshot(),action);
     if (pressed) g_digitalActive.fetch_add(1, std::memory_order_relaxed);
@@ -225,6 +239,12 @@ void UpdateMotion(const xr::FrameInput& frame) {
         m.valid = false;
         return;
     }
+    // 1.0.3 (owner: "the gyro model for VR controllers with PlayStation doesn't work in F3"). Publish runs twice
+    // per frame whenever first person is on (stereo::RecordList, then fpcam::Prepare with the same FrameInput):
+    // the second call saw dt = 0 and zeroed the hand's velocity and acceleration, so in F1 / F3 the pad's
+    // accelerometer read gravity only - tilting worked, moving the controller up / down / left / right never did.
+    // The same frame is used once.
+    if (m.valid && frame.tickMs == m.tick) return;
     const float* a = h.aimRel.m;
     const float p[3] = {a[12], a[13], a[14]};
     const float dt = m.valid && frame.tickMs > m.tick ? std::min(float(frame.tickMs - m.tick) / 1000.f, 0.1f) : 0.f;
@@ -390,6 +410,10 @@ DWORD Merge(DWORD user, DWORD result, XINPUT_STATE* state) {
     if (!logged.exchange(true))
         Log("VRINPUT XInput: the game polls pad 1 (real pad there: %s); VR controllers merged in",
             result == ERROR_SUCCESS ? "yes" : "no");
+    if (result == ERROR_SUCCESS) {  // a real pad's A: the welcome windows' confirm (kept from the game while they take it)
+        welcome::NotePadConfirm((state->Gamepad.wButtons & XINPUT_GAMEPAD_A) != 0);
+        if (welcome::TakesPadConfirm()) state->Gamepad.wButtons &= ~WORD(XINPUT_GAMEPAD_A);
+    }
     const LegacyState st = Snapshot();
     const WORD buttons = XInputButtons(st);
     const bool vrActive = buttons || st.moveX || st.moveY || st.viewX || st.viewY || st.leftTrigger || st.rightTrigger;
@@ -512,6 +536,8 @@ LegacyState Snapshot() {
     std::lock_guard lock(g_sampleMutex);
     const uint64_t now=GetTickCount64();
     if (!xr::Running() || !g_sampleTick || now<g_sampleTick || now-g_sampleTick>250) return {};
+    // A welcome window is up (playbook 11.4: mandatory): the VR controllers drive only it, the game gets nothing.
+    if (welcome::Active()) return {};
     LegacyState out = Map(g_sample,g_gameplay);
     if (g_startPulse && now < g_chord.pulseUntil) out.buttons |= kRightMenu;  // Start (Button case 0)
     // A controller pointing at the VR settings panel: its trigger clicks the panel, never the game.

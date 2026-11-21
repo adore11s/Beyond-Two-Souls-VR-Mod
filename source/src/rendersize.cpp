@@ -65,48 +65,212 @@ T& At(uint8_t* p, size_t off) {
 
 // The desktop window (0.17.5, owner: "it renders a big square for VR, on the desktop you just see a small
 // window"). The swapchain's size is independent of the window's (DXGI scales on Present), and the game's
-// window procedure (FUN_1407acb30) has no WM_SIZE handling, so the window can be small while the game
-// renders N x N. While square: a `desktop_window` x `desktop_window` client area (b2svr.ini, default 720,
-// 0 = leave the window alone) in the middle of its monitor, checked once a second (the game sets the window
-// again only when its resolution or display mode changes); back to the game's own size, the window goes
-// back where it was. DisplayCfg+0x18 = the game's window (FUN_140828a60).
+// window procedure (FUN_1407acb30) has no WM_SIZE handling, so the window can be any size while the game
+// renders N x N. DisplayCfg+0x18 = the game's window (FUN_140828a60).
+// 1.0.3 (playbook revision 23, 08.4; owner: "window on desktop resizeable"): while VR renders square the window is HD by
+// default (b2svr.ini desktop_window = the client HEIGHT, 720 -> 1280 x 720; 0 = leave the window alone), always 16:9,
+// and the player can drag its edges, maximize, restore or snap it; the player's height is kept in desktop_window_h for
+// the next VR start. Every window change runs on the window's own thread: a window procedure in front of the game's
+// does the work when the game thread posts a registered message (SetWindowLongPtr(GWL_STYLE) or a synchronous
+// SetWindowPos from another thread would send messages across threads). The game never sees the size (it renders N x N
+// whatever the window is); the 3D scene is cropped to fill the 16:9 window (xr.cpp mirror, DesktopCrop) and the game's
+// 2D layer - a 16:9 canvas stretched over the square - shows at its own shape in a 16:9 window. VR off: the player's
+// own placement back and only the style bits the mod added removed.
 constexpr size_t kWindow = 0x18;
-int g_windowSize = 720;
-RECT g_savedWindow{};
-bool g_windowSaved = false;
+int g_windowSize = 720;          // b2svr.ini desktop_window: the default client height (0 = window left alone)
+std::atomic<int> g_windowH{0};   // the player's height (desktop_window_h), 0 = the default
+std::atomic<bool> g_cropOn{true};  // b2svr.ini desktop_crop (0 = black bars instead of the crop)
+std::atomic<HWND> g_hwnd{nullptr};
+std::atomic<bool> g_owned{false};  // the mod owns the window's shape now (square VR)
+bool g_placed = false;             // the first placement in the middle of the monitor is done (window thread)
+WINDOWPLACEMENT g_savedPlacement{sizeof(WINDOWPLACEMENT)};
+bool g_haveSavedPlacement = false;
+LONG_PTR g_addedStyle = 0;         // WS_THICKFRAME / WS_MAXIMIZEBOX bits the mod added
+WNDPROC g_gameProc = nullptr;
+UINT g_msg = 0;                    // registered "B2SVR desktop window" message: wParam 1 = update, 2 = give back
+bool g_inSizeMove = false;
 uint64_t g_windowCheck = 0;
+
+int Width169(int h) { return int(std::lround(double(h) * 16.0 / 9.0)); }
+
+std::wstring IniPathW();
+
+// Client size -> window size for this window's current style.
+SIZE OuterFor(HWND w, int cw, int ch) {
+    RECT r{0, 0, cw, ch};
+    AdjustWindowRectEx(&r, DWORD(GetWindowLongPtrW(w, GWL_STYLE)), FALSE, DWORD(GetWindowLongPtrW(w, GWL_EXSTYLE)));
+    return {r.right - r.left, r.bottom - r.top};
+}
+
+// The client height to keep: the player's, else the default; never larger than the monitor's work area allows.
+int WantedHeight(HWND w) {
+    int h = g_windowH.load() > 0 ? g_windowH.load() : g_windowSize;
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi);
+    const SIZE frame = OuterFor(w, 0, 0);
+    const int maxH = (mi.rcWork.bottom - mi.rcWork.top) - frame.cy;
+    const int maxWH = int(double((mi.rcWork.right - mi.rcWork.left) - frame.cx) * 9.0 / 16.0);
+    h = std::min(h, std::min(maxH, maxWH));
+    return std::max(h, 160);
+}
+
+// Window thread: the mod's shape (first placement centred, then the size only) or the player's window back.
+void WindowWork(HWND w, WPARAM what) {
+    if (what == 2) {
+        if (!g_haveSavedPlacement) return;
+        g_haveSavedPlacement = false;
+        g_placed = false;
+        if (g_addedStyle) {
+            SetWindowLongPtrW(w, GWL_STYLE, GetWindowLongPtrW(w, GWL_STYLE) & ~g_addedStyle);
+            g_addedStyle = 0;
+        }
+        SetWindowPlacement(w, &g_savedPlacement);
+        SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        Log("RENDERSIZE desktop window back to its placement before VR");
+        return;
+    }
+    if (!g_owned.load() || !g_windowSize || g_inSizeMove || IsIconic(w)) return;
+    if (!g_haveSavedPlacement) {
+        g_savedPlacement.length = sizeof(g_savedPlacement);
+        g_haveSavedPlacement = GetWindowPlacement(w, &g_savedPlacement) != FALSE;
+    }
+    const LONG_PTR style = GetWindowLongPtrW(w, GWL_STYLE);
+    if ((style & WS_CAPTION) == WS_CAPTION) {  // a framed window: make it sizeable (a borderless one is left so)
+        const LONG_PTR missing = (WS_THICKFRAME | WS_MAXIMIZEBOX) & ~style;
+        if (missing) {
+            g_addedStyle |= missing;
+            SetWindowLongPtrW(w, GWL_STYLE, style | missing);
+            SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+    if (IsZoomed(w)) return;  // maximized: WM_GETMINMAXINFO already gave the largest 16:9
+    RECT c{};
+    GetClientRect(w, &c);
+    const int cw = c.right - c.left, ch = c.bottom - c.top;
+    if (!g_placed) {
+        const int h = WantedHeight(w), wd = Width169(h);
+        const SIZE o = OuterFor(w, wd, h);
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi);
+        const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - o.cx) / 2;
+        const int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - o.cy) / 2;
+        SetWindowPos(w, nullptr, x, y, o.cx, o.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        g_placed = true;
+        Log("RENDERSIZE desktop window %dx%d (16:9, resizable; the headset still gets the full square)", wd, h);
+        return;
+    }
+    // After the first placement only the size: the player's height (a snapped window keeps its height and gets the
+    // 16:9 width); the game's own window changes are undone here too.
+    const int h = ch > 0 ? ch : WantedHeight(w);
+    const int wd = Width169(h);
+    if (std::abs(cw - wd) <= 1) return;
+    const SIZE o = OuterFor(w, wd, h);
+    SetWindowPos(w, nullptr, 0, 0, o.cx, o.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+LRESULT CALLBACK WindowProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    if (g_msg && m == g_msg) {
+        WindowWork(w, wp);
+        return 0;
+    }
+    if (g_owned.load() && g_windowSize) {
+        switch (m) {
+            case WM_ENTERSIZEMOVE: g_inSizeMove = true; break;
+            case WM_EXITSIZEMOVE: {
+                g_inSizeMove = false;
+                RECT c{};
+                GetClientRect(w, &c);
+                const int h = c.bottom - c.top;
+                if (h >= 160 && h != g_windowH.load() && !IsZoomed(w)) {
+                    g_windowH = h;
+                    WritePrivateProfileStringW(L"b2svr", L"desktop_window_h", std::to_wstring(h).c_str(), IniPathW().c_str());
+                    Log("RENDERSIZE desktop window resized by the player: %dx%d (kept in b2svr.ini desktop_window_h)",
+                        Width169(h), h);
+                }
+                break;
+            }
+            case WM_SIZING: {
+                CallWindowProcW(g_gameProc, w, m, wp, lp);
+                RECT* rc = reinterpret_cast<RECT*>(lp);
+                const SIZE frame = OuterFor(w, 0, 0);
+                int cw = (rc->right - rc->left) - frame.cx, ch = (rc->bottom - rc->top) - frame.cy;
+                RECT now{};
+                GetClientRect(w, &now);
+                const int dw = std::abs(cw - (now.right - now.left)), dh = std::abs(ch - (now.bottom - now.top));
+                // a side edge sets the height from the width, a top / bottom edge the width from the height, a corner
+                // whichever side moved further
+                const bool byWidth = wp == WMSZ_LEFT || wp == WMSZ_RIGHT ||
+                                     (wp != WMSZ_TOP && wp != WMSZ_BOTTOM && dw * 9 >= dh * 16);
+                if (byWidth) ch = int(std::lround(cw * 9.0 / 16.0));
+                else cw = Width169(ch);
+                if (ch < 160) {
+                    ch = 160;
+                    cw = Width169(ch);
+                }
+                const int ow = cw + frame.cx, oh = ch + frame.cy;
+                // the opposite edge or corner stays where it is
+                if (wp == WMSZ_LEFT || wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT) rc->left = rc->right - ow;
+                else rc->right = rc->left + ow;
+                if (wp == WMSZ_TOP || wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT) rc->top = rc->bottom - oh;
+                else rc->bottom = rc->top + oh;
+                return TRUE;
+            }
+            case WM_GETMINMAXINFO: {
+                CallWindowProcW(g_gameProc, w, m, wp, lp);
+                auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
+                const SIZE minO = OuterFor(w, 284, 160);
+                mm->ptMinTrackSize = {minO.cx, minO.cy};
+                MONITORINFO mi{sizeof(mi)};
+                GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi);
+                const SIZE frame = OuterFor(w, 0, 0);
+                const int aw = (mi.rcWork.right - mi.rcWork.left) - frame.cx, ah = (mi.rcWork.bottom - mi.rcWork.top) - frame.cy;
+                int ch = ah, cw = Width169(ah);
+                if (cw > aw) {
+                    cw = aw;
+                    ch = int(std::lround(aw * 9.0 / 16.0));
+                }
+                const SIZE o = OuterFor(w, cw, ch);
+                mm->ptMaxSize = {o.cx, o.cy};
+                // relative to the monitor's own corner (Windows moves it onto the monitor the window maximizes on)
+                mm->ptMaxPosition = {(mi.rcWork.left - mi.rcMonitor.left) + ((mi.rcWork.right - mi.rcWork.left) - o.cx) / 2,
+                                     (mi.rcWork.top - mi.rcMonitor.top) + ((mi.rcWork.bottom - mi.rcWork.top) - o.cy) / 2};
+                return 0;
+            }
+            default: break;
+        }
+    }
+    return CallWindowProcW(g_gameProc, w, m, wp, lp);
+}
+
+// Game thread: the window procedure goes in front of the game's once (SetWindowLongPtr(GWLP_WNDPROC) sends no
+// message), then the work is posted to the window's own thread.
+bool EnsureWindowProc(HWND w) {
+    if (g_gameProc) return true;
+    if (!g_msg) g_msg = RegisterWindowMessageW(L"B2SVR desktop window");
+    g_gameProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(w, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&WindowProc)));
+    if (!g_gameProc) {
+        Log("RENDERSIZE desktop window: own window procedure not set (error %lu) - window left as the game has it",
+            GetLastError());
+        return false;
+    }
+    Log("RENDERSIZE desktop window procedure installed (resizable 16:9 window in VR)");
+    return true;
+}
 
 void SmallWindow(uint8_t* cfg) {
     HWND w = At<HWND>(cfg, kWindow);
     if (!g_windowSize || !w || !IsWindow(w)) return;
-    RECT client{};
-    GetClientRect(w, &client);
-    if (client.right - client.left == g_windowSize && client.bottom - client.top == g_windowSize) return;
-    if (!g_windowSaved) {
-        GetWindowRect(w, &g_savedWindow);
-        g_windowSaved = true;
-    }
-    RECT r{0, 0, g_windowSize, g_windowSize};
-    AdjustWindowRectEx(&r, DWORD(GetWindowLongPtrW(w, GWL_STYLE)), FALSE, DWORD(GetWindowLongPtrW(w, GWL_EXSTYLE)));
-    const int ww = r.right - r.left, wh = r.bottom - r.top;
-    MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi);
-    const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - ww) / 2;
-    const int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - wh) / 2;
-    SetWindowPos(w, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
-    static int logs = 0;
-    if (logs++ < 5)
-        Log("RENDERSIZE desktop window %dx%d (the headset still gets the full square)", g_windowSize, g_windowSize);
+    g_hwnd = w;
+    if (!EnsureWindowProc(w)) return;
+    g_owned = true;
+    PostMessageW(w, g_msg, 1, 0);
 }
 
 void RestoreWindow(uint8_t* cfg) {
-    if (!g_windowSaved) return;
-    g_windowSaved = false;
+    const bool was = g_owned.exchange(false);
     HWND w = At<HWND>(cfg, kWindow);
-    if (!w || !IsWindow(w)) return;
-    SetWindowPos(w, nullptr, g_savedWindow.left, g_savedWindow.top, g_savedWindow.right - g_savedWindow.left,
-                 g_savedWindow.bottom - g_savedWindow.top, SWP_NOZORDER | SWP_NOACTIVATE);
-    Log("RENDERSIZE desktop window back to its size before VR");
+    if (!was || !w || !IsWindow(w) || !g_gameProc) return;
+    PostMessageW(w, g_msg, 2, 0);
 }
 
 // The size in effect now: N, the Auto size once known, 0 = the game's own size.
@@ -307,6 +471,7 @@ std::wstring IniPath() {
     std::wstring s = path;
     return s.substr(0, s.find_last_of(L"\\/") + 1) + L"b2svr.ini";
 }
+std::wstring IniPathW() { return IniPath(); }
 
 }  // namespace
 
@@ -322,6 +487,14 @@ void Install() {
         GetPrivateProfileStringW(L"b2svr", L"desktop_window", L"720", value, 32, path);
         const int dw = _wtoi(value);
         g_windowSize = dw >= 240 && dw <= 4096 ? dw : 0;
+        GetPrivateProfileStringW(L"b2svr", L"desktop_window_h", L"0", value, 32, path);
+        const int ph = _wtoi(value);
+        g_windowH = ph >= 160 && ph <= 4320 ? ph : 0;
+        GetPrivateProfileStringW(L"b2svr", L"desktop_crop", L"1", value, 32, path);
+        g_cropOn = _wtoi(value) != 0;
+        Log("RENDERSIZE desktop window in VR: %d x %d client%s, 16:9, resizable; 3D view %s", Width169(g_windowH.load() > 0 ? g_windowH.load() : g_windowSize),
+            g_windowH.load() > 0 ? g_windowH.load() : g_windowSize, g_windowH.load() > 0 ? " (the player's size)" : "",
+            g_cropOn.load() ? "cropped to fill it" : "with bars (desktop_crop 0)");
     }
     void* set = reinterpret_cast<void*>(game::Va(kSetRenderSizeVa));
     void* update = reinterpret_cast<void*>(game::Va(kResolutionUpdateVa));
@@ -383,6 +556,19 @@ uint32_t AutoSize() {
 }
 
 bool Available() { return g_available.load(); }
+
+bool DesktopCrop(uint32_t bbW, uint32_t bbH, float* v0, float* v1) {
+    if (!g_cropOn.load() || !g_owned.load() || !bbW || !bbH) return false;
+    HWND w = g_hwnd.load();
+    RECT c{};
+    if (!w || !GetClientRect(w, &c) || c.right <= c.left || c.bottom <= c.top) return false;
+    const double window = double(c.right - c.left) / double(c.bottom - c.top), picture = double(bbW) / double(bbH);
+    if (window <= picture * 1.01) return false;  // not wider than the picture: shown whole
+    const double rows = picture / window;  // the middle band of the picture's height that fills the window
+    *v0 = float(0.5 * (1.0 - rows));
+    *v1 = float(1.0 - 0.5 * (1.0 - rows));
+    return true;
+}
 
 bool Command(const char* verb, const char* arg) {
     if (std::strcmp(verb, "rendersize") != 0) return false;

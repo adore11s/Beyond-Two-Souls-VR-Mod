@@ -1,12 +1,10 @@
-// VR settings panel (panel.h): the GoW VR mod's GDI panel (its vr/panel.cpp, MIT, same owner) on the fixed
-// ten-row profile GOW_STYLE_TEN_ROW_V4 (playbook chapter 2, revision 6: "Rendering method" offers Native | AFR | Mono)
-// plus one B2S row (B2S_ELEVEN_ROW_V2): the GoW
-// design tokens, fonts, row pitch, hit geometry and trigger rules, the finishers and wall-collision rows removed,
-// "Aiden possessions (first person)" after the two first-person rows (owner 2026-10-28, EXP-046), "Hand smoothing
-// (first person)" after Motion controls (owner 2026-10-28), no health-bars row (Beyond has no status meters), and the red accent
-// replaced by the blues of the Beyond: Two Souls cover (owner 2026-10-27,
-// sampled from the Steam library capsule: light blue median #6BA2C7, light end #8DBEDE, navy #132631). Rows bind
-// to B2S capabilities; a choice whose capability is not there is drawn disabled and does nothing, rather than a
+// VR settings panel (panel.h): the GoW VR mod's GDI panel (its vr/panel.cpp, MIT, same owner) on profile
+// B2S_ELEVEN_ROW_V6 (1.0.3, playbook revision 23, panel_math.h): the GOW_STYLE_NINE_ROW_V6 rows and geometry, the V6
+// look (patterned grey background, the built-in Montserrat, brighter labels / hints), the owner's light blue of the
+// Beyond: Two Souls cover (2026-10-27, sampled from the Steam library capsule: light blue median #6BA2C7, light end
+// #8DBEDE) where GoW has red, and two B2S rows: "Aiden possessions (first person)" (EXP-046) and "Camera closer (third
+// person)" (owner 2026-11-15). No "Hand smoothing" row (revision 13; b2svr.ini hand_smoothing). Rows bind to B2S
+// capabilities; a choice whose capability is not there is drawn disabled and does nothing, rather than a
 // working-looking button.
 #include "panel.h"
 
@@ -22,6 +20,7 @@
 #include "rendersize.h"
 #include "stereo.h"
 #include "vrinput.h"
+#include "welcome_draw.h"
 
 namespace b2s::panel {
 namespace {
@@ -30,7 +29,8 @@ constexpr int kW = kWidthPx, kH = kHeightPx;
 
 enum Action {
     kNone, kF1On, kF1Off, kF3On, kF3Off, kMotionOn, kMotionOff, kTurnSmooth, kTurnSnap, kStepDown, kStepUp,
-    kPadXbox, kPadPs, kSizeDown, kSizeUp, kNative, kAfr, kMono, kVrOn, kVrOff, kSmoothOn, kSmoothOff, kPossOn, kPossOff
+    kPadXbox, kPadPs, kSizeDown, kSizeUp, kNative, kAfr, kMono, kVrOn, kVrOff, kSmoothOn, kSmoothOff, kPossOn, kPossOff,
+    kPushDown, kPushUp
 };
 struct Button {
     RECT r;
@@ -46,10 +46,11 @@ HBITMAP g_bmp = nullptr;
 uint32_t* g_bits = nullptr;
 HFONT g_fTitle = nullptr, g_fLabel = nullptr, g_fButton = nullptr, g_fHint = nullptr;
 uint32_t g_out[kW * kH];
+uint32_t g_bgPix[kW * kH];  // V6 background pattern
 uint32_t g_cursor[kCursorPx * kCursorPx];
 bool g_cursorMade = false;
 
-Button g_buttons[24];
+Button g_buttons[28];
 int g_nButtons = 0;
 Action g_hover = kNone;
 bool g_needDraw = true;
@@ -79,6 +80,8 @@ void Apply(Action a) {
             else fpcam::SetTurnSpeed(StepPreset(kSpeeds, fpcam::TurnSpeed(), d));
             break;
         }
+        case kPushDown:
+        case kPushUp: stereo::SetCameraPush(StepPreset(kPushes, stereo::CameraPush(), a == kPushUp ? 1 : -1)); break;
         case kPadXbox: vrinput::SetPadType(2); break;
         case kPadPs: vrinput::SetPadType(5); break;
         case kSizeDown:
@@ -94,10 +97,11 @@ void Apply(Action a) {
     }
     g_needDraw = true;
     Log("PANEL action %d -> F1 %d, F3 %d, motion controls %d, hand smoothing %d, turning %s %.0f %% / %.0f deg, pad %s, "
-        "picture size %d, %s",
+        "picture size %d, %s, camera closer %.2f m",
         int(a), int(fpcam::GameplayFP()), int(fpcam::CutsceneFP()), int(fpcam::MotionControls()),
         int(fpcam::HandSmoothing()), fpcam::SnapTurn() ? "snap" : "smooth", fpcam::TurnSpeed() * 100.f, fpcam::SnapDegrees(),
-        vrinput::PadType() == 5 ? "PlayStation" : "Xbox", rendersize::Setting(), stereo::MethodName(stereo::GetMethod()));
+        vrinput::PadType() == 5 ? "PlayStation" : "Xbox", rendersize::Setting(), stereo::MethodName(stereo::GetMethod()),
+        stereo::CameraPush());
 }
 
 bool MakeSurface() {
@@ -118,14 +122,28 @@ bool MakeSurface() {
     }
     g_bits = static_cast<uint32_t*>(bits);
     SelectObject(g_dc, g_bmp);
-    auto font = [](int px, int weight) {
+    auto font = [](int px, int weight, const wchar_t* face) {
         return CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, face);
     };
-    g_fTitle = font(54, FW_BOLD);
-    g_fLabel = font(36, FW_SEMIBOLD);
-    g_fButton = font(38, FW_SEMIBOLD);
-    g_fHint = font(28, FW_NORMAL);
+    // V6 (playbook revision 20): Montserrat (SIL OFL 1.1) built into the DLL (RCDATA 3101 Bold, 3102 SemiBold, 3103
+    // Regular), added for this process only - the same on every PC, never a system font.
+    const bool mont = welcome::LoadPanelFonts();
+    if (mont) {  // GDI faces: "Montserrat" Bold / Regular, "Montserrat SemiBold" (its own family)
+        g_fTitle = font(50, FW_BOLD, L"Montserrat");
+        g_fLabel = font(32, FW_SEMIBOLD, L"Montserrat SemiBold");
+        g_fButton = font(34, FW_BOLD, L"Montserrat");
+        g_fHint = font(26, FW_NORMAL, L"Montserrat");
+    } else {
+        g_fTitle = font(54, FW_BOLD, L"Segoe UI");
+        g_fLabel = font(36, FW_SEMIBOLD, L"Segoe UI");
+        g_fButton = font(38, FW_SEMIBOLD, L"Segoe UI");
+        g_fHint = font(28, FW_NORMAL, L"Segoe UI");
+    }
+    Log("PANEL font %s", mont ? "Montserrat (built in)" : "Segoe UI (the built-in Montserrat did not load)");
+    // V6: the patterned grey, computed once and copied under every redraw.
+    for (int py = 0; py < kH; ++py)
+        for (int px = 0; px < kW; ++px) g_bgPix[py * kW + px] = welcome::PatternPixel(px, py);
     SetBkMode(g_dc, TRANSPARENT);
     return true;
 }
@@ -160,7 +178,7 @@ struct Row {
     Action a, b, c;               // the choices (c: a third, Rendering method only), or the stepper's down / up
     const wchar_t *ta, *tb, *tc;  // their texts (ta nullptr: a stepper; tc nullptr: two choices)
     int sel;                      // the selected choice: 0 a, 1 b, 2 c (choices only)
-    int value;                    // stepper: 0 = turning step, 1 = picture size
+    int value;                    // stepper: 0 = turning step, 1 = picture size, 2 = camera closer
     bool enabledA, enabledB, enabledC;
 };
 int Rows(Row* r) {
@@ -175,11 +193,15 @@ int Rows(Row* r) {
     // view, the arms on the controllers when motion controls are on).
     r[n++] = two(L"Aiden possessions (first person)", kPossOn, kPossOff, L"On", L"Off", fpcam::PossessionFP());
     r[n++] = two(L"Motion controls (first person)", kMotionOn, kMotionOff, L"On", L"Off", fpcam::MotionControls());
-    // The drawn hands of motion controls only (fpcam); it stays selectable while motion controls are off.
-    r[n++] = two(L"Hand smoothing (first person)", kSmoothOn, kSmoothOff, L"On", L"Off", fpcam::HandSmoothing());
+    // No "Hand smoothing" row (playbook revision 13, the owner's rule for every port): b2svr.ini hand_smoothing only.
     r[n++] = two(L"Turning (first person)", kTurnSmooth, kTurnSnap, L"Smooth", L"Snap", !snap);
     r[n++] = {snap ? L"Snap angle" : L"Turning speed", kStepDown, kStepUp, kNone, nullptr, nullptr, nullptr, 0, 0, true, true,
               false};
+    // 1.0.3 (owner): the game's own camera moved toward the characters (third person only: first person has its own
+    // eye), Off .. 2 m.
+    constexpr float kPushTop = kPushes[sizeof(kPushes) / sizeof(kPushes[0]) - 1];
+    r[n++] = {L"Camera closer (third person)", kPushDown, kPushUp, kNone, nullptr, nullptr, nullptr, 0, 2,
+              stereo::CameraPush() > 0.001f, stereo::CameraPush() < kPushTop - 0.001f, false};
     r[n++] = two(L"Controller buttons", kPadXbox, kPadPs, L"Xbox", L"PlayStation", vrinput::PadType() != 5);
     // '+' at Auto and '-' at the game's own size do nothing (panel_math.h StepSize).
     const int size = rendersize::Setting();
@@ -195,7 +217,7 @@ int Rows(Row* r) {
     return n;
 }
 
-void Layout(wchar_t* stepText, wchar_t* sizeText) {
+void Layout(wchar_t* stepText, wchar_t* sizeText, wchar_t* pushText) {
     g_nButtons = 0;
     Row rows[kRows];
     const int n = Rows(rows);
@@ -214,6 +236,9 @@ void Layout(wchar_t* stepText, wchar_t* sizeText) {
             AddButton(820, y, 140, kButtonH, r.b, L"+", false, r.enabledB);
         }
     }
+    const float push = stereo::CameraPush();
+    if (push < 0.001f) swprintf_s(pushText, 32, L"Off");
+    else swprintf_s(pushText, 32, L"%.2f m", push);
     if (fpcam::SnapTurn()) swprintf_s(stepText, 32, L"%.0f\x00b0", fpcam::SnapDegrees());
     else swprintf_s(stepText, 32, L"%.0f %%", fpcam::TurnSpeed() * 100.f);
     // GoW formatting: "2048 x 2048", "Auto (N x N)".
@@ -231,14 +256,15 @@ void Layout(wchar_t* stepText, wchar_t* sizeText) {
 
 void Draw() {
     if (!MakeSurface()) return;
-    wchar_t stepText[32], sizeText[32];
-    Layout(stepText, sizeText);
-    // Beyond: Two Souls cover palette (owner 2026-10-27: "light blue like the cover instead of red"): the GoW
-    // tokens with the red accent replaced by the cover's light blue and the greys turned to its navy.
-    const COLORREF bg = RGB(27, 42, 53), title = RGB(94, 151, 191), button = RGB(52, 66, 77), hover = RGB(74, 91, 104),
+    wchar_t stepText[32], sizeText[32], pushText[32];
+    Layout(stepText, sizeText, pushText);
+    // V6 tokens (playbook revision 20) with the owner's accent: the light blue of the Beyond: Two Souls cover
+    // (owner 2026-10-27; selected #5E97BF, selected hover #7DB0D3) where GoW has red.
+    const COLORREF title = RGB(94, 151, 191), button = RGB(66, 66, 70), hover = RGB(96, 96, 102),
                    selected = RGB(94, 151, 191), selectedHover = RGB(125, 176, 211), white = RGB(245, 245, 245),
-                   label = RGB(200, 210, 218), hint = RGB(147, 163, 175), valueBox = RGB(19, 32, 42);
-    Fill({0, 0, kW, kH}, bg);
+                   label = RGB(225, 225, 230), hint = RGB(165, 165, 170), valueBox = RGB(30, 30, 32);
+    GdiFlush();
+    std::memcpy(g_bits, g_bgPix, sizeof(g_bgPix));  // the patterned grey
     Fill({0, 0, kW, 100}, title);
     Text(L"VR SETTINGS", {40, 0, kW - 40, 100}, g_fTitle, white, DT_LEFT | DT_VCENTER);
     Row rows[kRows];
@@ -249,7 +275,8 @@ void Draw() {
         if (!rows[i].ta) {  // the stepper's value box
             const int by = y + kButtonY;
             Fill({200, by, 800, by + kButtonH}, valueBox, 14);
-            Text(rows[i].value == 1 ? sizeText : stepText, {200, by, 800, by + kButtonH}, g_fButton, white,
+            Text(rows[i].value == 1 ? sizeText : rows[i].value == 2 ? pushText : stepText, {200, by, 800, by + kButtonH},
+                 g_fButton, white,
                  DT_CENTER | DT_VCENTER);
         }
     }
@@ -259,7 +286,7 @@ void Draw() {
         Fill(b.r, b.selected ? (hv ? selectedHover : selected) : (hv ? hover : button), 14);
         Text(b.text, b.r, g_fButton, b.enabled ? white : hint, DT_CENTER | DT_VCENTER);
     }
-    // Footer (ELEVEN_ROW_V2: 1540..1580, 1584..1624, 1628..1668).
+    // Footer (TWELVE_ROW_V1: 1668..1708, 1712..1752, 1756..1796).
     Text(L"Point a controller at an option and pull its trigger.", {40, kH - 150, kW - 40, kH - 110}, g_fHint, hint,
          DT_LEFT | DT_VCENTER);
     Text(L"VR off: press F9 on the keyboard to turn it back on.", {40, kH - 106, kW - 40, kH - 66}, g_fHint, hint,
@@ -369,10 +396,10 @@ void Update(const xr::FrameInput& in, const pose::Vec3& screen, float screenW, F
     // Redraw when a value or the hovered button changed (values also change with F1 / F3 / F10 / F11, the head
     // switch and b2svr.ini).
     char state[160];
-    sprintf_s(state, "%d %d %d %d %d %.2f %.0f %d %d %u %d %d %d", int(fpcam::GameplayFP()), int(fpcam::CutsceneFP()),
+    sprintf_s(state, "%d %d %d %d %d %.2f %.0f %d %d %u %d %d %d %.2f", int(fpcam::GameplayFP()), int(fpcam::CutsceneFP()),
               int(fpcam::MotionControls()), int(fpcam::HandSmoothing()), int(fpcam::SnapTurn()), fpcam::TurnSpeed(), fpcam::SnapDegrees(),
               vrinput::PadType(), rendersize::Setting(), rendersize::AutoSize(), stereo::GetMethod(),
-              int(stereo::AfrSupported()), int(rendersize::Available()));
+              int(stereo::AfrSupported()), int(rendersize::Available()), stereo::CameraPush());
     if (hover != g_hover || std::strcmp(state, g_lastState) != 0 || g_needDraw) {
         g_hover = hover;
         strcpy_s(g_lastState, state);

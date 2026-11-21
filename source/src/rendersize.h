@@ -18,6 +18,11 @@ uint32_t AutoSize();
 // The render size hooks are installed (false on a build where they were not found).
 bool Available();
 
+// The desktop window (playbook 08.4): when it is wider than the game's picture (the square in VR), the band of the
+// picture's rows [v0, v1) that fills it - the 3D scene cropped to the window's 16:9 (no black bars). False = show the
+// whole picture (not VR, a window as narrow as the picture, b2svr.ini desktop_crop=0).
+bool DesktopCrop(uint32_t bbW, uint32_t bbH, float* v0, float* v1);
+
 // devctl: "rendersize <N|auto|off>" (applied at the next frame).
 bool Command(const char* verb, const char* arg);
 
