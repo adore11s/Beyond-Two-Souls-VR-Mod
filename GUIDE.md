@@ -148,7 +148,7 @@ The panel shows with the game's pause menu and while the main menu's **Options**
 | `desktop_crop` | 1 | 1 = the 3D view fills the desktop window (top and bottom cut off on the monitor only); 0 = black bars |
 | `camera_forward` | 0 | Third-person camera closer, metres (0 .. 2; the VR settings: Camera closer) |
 | `light_occlusion` | vr | vr = every light glow is drawn in both eyes in VR; game = the game's own visibility test for far lights (can show a glow in one eye only) |
-| `mirror_prev_view` | eye | eye = mirrors and reflections drawn with each eye's own previous view; game = the game's (shared by both eyes: reflections slide when you move your head) |
+| `mirror_prev_view` | eye | eye = mirrors and reflections drawn with each eye's own previous view; game = the game's (shared by both eyes). Reflections still slide when you move your head with either choice |
 | `turn` | smooth | Right-stick turning in first person (F1): smooth or snap |
 | `turn_speed` | 1 | Smooth turning speed: 1 = 120 degrees a second (the VR settings: 0.2 .. 1) |
 | `snap_turn_degrees` | 45 | Snap turning step in degrees (the VR settings: 15 / 30 / 45 / 60 / 90) |
@@ -200,7 +200,7 @@ The installer also sets three of the game's own options for VR, in the game's op
 - **Cinematic framing.** Some cutscenes keep the game's widescreen framing.
 - **Performance.** Native draws the game twice per frame, AFR and Mono once; if the headset stutters, pick **Mono** (or AFR) or a smaller VR picture size in the VR settings, or lower the game's graphics settings.
 - **The game window on your monitor** is 1280 x 720 while VR runs (`desktop_window`); resize it as you like (it stays 16:9). It shows your left eye with the 3D view cropped to fill it; the headset gets the full picture.
-- **Reflections** (mirrors, shiny floors): the fix for reflections sliding when you move your head is not yet checked in a headset; tell me if they still slide.
+- **Reflections** (mirrors, shiny floors) slide when you move your head. Not fixed yet.
 
 ---
 
